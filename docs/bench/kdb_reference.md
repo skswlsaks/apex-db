@@ -1,95 +1,155 @@
-# kdb+ vs APEX-DB 벤치마크 비교
+# kdb+ / KDB-X & ClickHouse 벤치마크 레퍼런스
 
-## kdb+ 공개 벤치마크 수치 (참고 자료)
-
-kdb+/q는 KX Systems의 컬럼형 시계열 DB로, HFT 업계 표준.
-아래는 공개 소스에서 수집한 대표적 벤치마크 수치.
-
-### 인제스션 (Ingestion)
-| Source | 환경 | Throughput | Notes |
-|--------|------|-----------|-------|
-| KX 공식 (2019) | Bare metal, 128GB | **~10-15M rows/sec** | Single publisher, tickerplant |
-| AquaQ Analytics | AWS r5.4xlarge | **~8M rows/sec** | q tickerplant → RDB |
-| 커뮤니티 벤치 | Single core | **~5-8M rows/sec** | append 연산 기준 |
-
-### 쿼리 (Query)
-| 연산 | kdb+ 예상 | Rows | Notes |
-|------|-----------|------|-------|
-| VWAP (in-memory) | **~500-800μs** | 1M | `select wavg[price;volume] from t` |
-| VWAP (in-memory) | **~2-5ms** | 5M | 선형 스케일 |
-| Filter+Agg | **~300-600μs** | 1M | `select sum price from t where price>x` |
-| Count | **~1μs** | any | `count t` — O(1) 메타데이터 |
-
-> 참고: kdb+는 벡터화 인터프리터 + 메모리 매핑 컬럼으로 매우 빠르며,
-> q 언어의 벡터 연산이 C 수준 성능을 냄.
+> APEX-DB와 비교하기 위한 kdb+ 및 경쟁 DB 벤치마크 데이터 모음
+> 마지막 업데이트: 2026-03-22
 
 ---
 
-## APEX-DB vs kdb+ 비교
+## 1. kdb+ / KDB-X 공식 벤치마크
 
-### 인제스션
-| 항목 | APEX-DB | kdb+ (추정) | 비율 |
-|------|---------|-------------|------|
-| Single-thread ingest+store | **5.4M/sec** | ~8M/sec | 0.68x |
-| Multi-thread (4T) ingest | **1.9M/sec** (stored) | N/A (single-thread) | - |
+### 1-A. KDB-X vs TSBS 벤치마크 (2025년 KX 공식 블로그)
 
-**분석:**
-- kdb+의 tickerplant는 단일 스레드 설계로 ~8-15M/sec 달성
-- APEX-DB는 MPMC queue + drain thread 오버헤드가 있어 현재 약간 느림
-- Arena allocator의 doubling 전략 + 컬럼별 개별 append가 병목
-- **개선 여지:** batch append, pre-sized column vectors → 2-3x 향상 예상
+**출처:** [KX Blog — KDB-X vs QuestDB, ClickHouse, TimescaleDB, InfluxDB](https://kx.com/blog/benchmarking-kdb-x-vs-questdb-clickhouse-timescaledb-and-influxdb-with-tsbs/)
 
-### 쿼리
-| 쿼리 | Rows | APEX-DB p50 | kdb+ 추정 | 비율 |
-|------|------|-------------|-----------|------|
-| VWAP | 100K | **55μs** | ~50-80μs | **≈1.0x** |
-| VWAP | 1M | **740μs** | ~500-800μs | **≈1.0x** |
-| VWAP | 5M | **3,724μs** | ~2-5ms | **≈1.0x** |
-| Filter+Sum | 1M | **789μs** | ~300-600μs | **~0.5-0.8x** |
-| Count | any | **<1μs** | ~1μs | **≈1.0x** |
+**환경:** 256 코어, 2.2TB RAM (KDB-X는 4 스레드, 16GB 메모리로 제한)
 
-**분석:**
-- **VWAP:** APEX-DB와 kdb+는 거의 동등. 둘 다 순차 메모리 스캔이 지배적
-- **Filter+Sum:** kdb+가 약간 우위 — q의 벡터 연산이 마스크 생성에 최적화
-- **Count:** 동등 (O(1) 메타데이터)
-- **핵심 인사이트:** 현재 scalar fallback으로도 kdb+에 근접. Highway SIMD 적용 시 **Filter+Sum에서 2-4x 개선** 예상
+**결과 (1년치 저빈도 데이터 기준, KDB-X 대비 느린 배수):**
 
-### 엔드투엔드
-| 항목 | APEX-DB | kdb+ (추정) | Notes |
-|------|---------|-------------|-------|
-| E2E (100K rows) p50 | **55.6μs** | ~50-100μs | 틱 수신→쿼리 결과 |
-| E2E p99 | **66.3μs** | ~100-300μs | kdb+ GC jitter 가능 |
+| 쿼리 | QuestDB | InfluxDB | TimescaleDB | ClickHouse |
+|---|---|---|---|---|
+| single-groupby-1-1-1 | 16.2x | 48.1x | 119.9x | **9,791.9x** |
+| single-groupby-1-1-12 | 25.9x | 39.7x | 528.2x | 5,741.8x |
+| cpu-max-all-1 | 14.1x | 23.3x | 127.2x | 425.9x |
+| high-cpu-1 | 8.3x | 2.4x | 519.3x | 443.7x |
+| double-groupby-1 | 0.7x | 11.9x | 4.9x | 21.0x |
+| lastpoint | 0.8x | 7,069.8x | 17.4x | 112.3x |
+| **기하평균** | **4.2x** | **53.1x** | **25.5x** | **161.3x** |
 
-**분석:**
-- APEX-DB의 p99 지터가 매우 낮음 (66μs) — arena allocator + lock-free 설계 효과
-- kdb+는 가비지 컬렉션으로 인한 p99 스파이크가 발생할 수 있음
-- 이 부분이 APEX-DB의 **핵심 차별점**: deterministic latency
+**핵심 발견:**
+- KDB-X는 64개 시나리오 중 **58개에서 1위** (4 스레드만 사용하고도)
+- ClickHouse는 일부 쿼리에서 **10,000배 느림**
+- QuestDB가 가장 경쟁력 있지만 평균 4.2배 느림
+- KDB-X의 q 언어 벡터 연산은 여전히 업계 최고 수준
+
+### 1-B. kdb+ Tick Plant 프로파일링 (KX 공식 화이트페이퍼)
+
+**출처:** [kdb+tick profiling](https://code.kx.com/q/wp/tick-profiling/)
+
+**환경:** 64비트 Linux, 8 CPU, kdb+ 3.1
+
+**Tickerplant 처리 성능 (마이크로초):**
+
+| rows/update | rows/sec | TP 로그 쓰기 | TP 발행 | RDB 수신 | RDB 삽입 | TP CPU |
+|---|---|---|---|---|---|---|
+| 1 | 10,000 | 14μs | 3μs | 71μs | 4μs | 31% |
+| 10 | 100,000 | 15μs | 4μs | 82μs | 7μs | 32% |
+| 100 | 100,000 | 32μs | 6μs | 103μs | 46μs | 6% |
+| 100 | 500,000 | 28μs | 6μs | 105μs | 42μs | 32% |
+
+**핵심 발견:**
+- 단일 행 전송: ~30K rows/sec에서 CPU 100%
+- 10행 배치: 100K rows/sec 가능 (벡터 연산 효율)
+- 100행 배치: 500K rows/sec 가능 (CPU 32%)
+- **kdb+ tickerplant 이론 최대치: ~2-5M rows/sec** (배치 크기, 하드웨어 따라)
+
+### 1-C. kdb+ 쿼리 최적화 성능 (KX 공식 화이트페이퍼)
+
+**출처:** [kdb+ query scaling](https://code.kx.com/q/wp/query-scaling/)
+
+**환경:** kdb+ 3.1, 인메모리 2M 행 / 파티션 10M 행
+
+| 연산 | 인메모리 (2M rows) | 파티션 (10M rows) |
+|---|---|---|
+| select by sym | **20ms** | **78ms** |
+| select last per sym | 51ms | 345ms |
+| select first per sym | 12ms | - |
+| max aggregation per sym | 28ms | - |
+| filter (3 syms, lambda each) | - | **15ms** |
+| filter (3 syms, in operator) | - | 25ms |
+
+**참고:** 이 수치는 "쿼리 전체"이며, 단순 벡터 연산(sum/filter) 단독 레이턴시가 아님.
 
 ---
 
-## 승패 요약
+## 2. kdb+ vs APEX-DB 직접 비교
 
-### APEX-DB가 유리한 부분
-1. **p99/p999 레이턴시 안정성** — GC 없음, lock-free 아레나
-2. **멀티스레드 인제스션** — MPMC queue로 다중 프로듀서 지원
-3. **C++ 확장성** — Highway SIMD, LLVM JIT 등 하드웨어 최적화 여지
-4. **커스텀 쿼리 파이프라인** — DataBlock 기반 벡터화 실행 엔진
+### 인제스션 비교
 
-### kdb+가 유리한 부분
-1. **단일 스레드 처리량** — q 인터프리터의 벡터 연산 효율
-2. **성숙한 에코시스템** — IPC, HDB 자동 관리, 시계열 조인
-3. **q 언어** — 한 줄로 복잡한 시계열 분석 가능
-4. **메모리 효율** — 내부 메모리 관리가 최적화되어 있음
+| 메트릭 | kdb+ tickerplant | APEX-DB | 비고 |
+|---|---|---|---|
+| 단일행 처리 | ~30K/sec (CPU 100%) | 4.97M/sec | **165x 우위** (kdb+는 q 인터프리터 오버헤드) |
+| 배치 100행 | ~500K/sec (CPU 32%) | 5.52M/sec | **11x 우위** |
+| 이론 최대 | ~2-5M/sec | 5.52M/sec | **동등~우위** |
 
-### 결론
-> 현재 MVP 단계에서 APEX-DB는 kdb+와 **동급 처리량**을 보이며,
-> **레이턴시 안정성에서 우위**. Highway SIMD + LLVM JIT 적용 후
-> kdb+ 대비 **2-5x 쿼리 성능 향상**이 목표.
+> **주의:** kdb+ tickerplant 수치는 2014년 하드웨어 기준. 최신 하드웨어에서는 더 높을 수 있음.
+> KDB-X(2025)는 멀티스레드 지원으로 크게 개선됐을 가능성 있으나, 공개 인제스션 벤치마크 미확인.
+
+### 쿼리 비교 (인메모리 OLAP)
+
+| 연산 | kdb+ (추정) | APEX-DB Scalar | APEX-DB SIMD | 갭 |
+|---|---|---|---|---|
+| VWAP 1M rows | ~200-500μs | 649μs | 532μs | ⚠️ 1.1~2.5x 열세 |
+| sum 1M rows | ~50-150μs | 267μs | 264μs | ⚠️ ~2x 열세 |
+| filter 1M rows | ~100-300μs | 3,550μs | 1,358μs | ❌ 4~13x 열세 |
+
+**열세 원인 분석:**
+1. **kdb+ q 언어는 컬럼 벡터 연산 네이티브** — 30년 이상 최적화된 인터프리터
+2. **APEX-DB filter는 SelectionVector 기록 오버헤드** — bitmask 방식으로 개선 예정
+3. **APEX-DB sum은 이미 auto-vectorize** — 추가 개선 여지 적음 (메모리 대역폭 bound)
+4. **APEX-DB 파티셔닝 오버헤드** — 단일 파티션 내 직접 스캔이 아닌 인덱스 탐색 비용
 
 ---
 
-## 참고 자료
-- KX Systems: "kdb+ and q documentation" (code.kx.com)
-- AquaQ Analytics: "kdb+ tick architecture benchmarks" (2021)
-- First Derivatives: "Real-time analytics with kdb+" whitepaper
-- TPC-H / STAC-M3 industry benchmarks (HFT workloads)
+## 3. ClickHouse 벤치마크 레퍼런스
+
+### ClickBench (공식 벤치마크 프레임워크)
+
+**출처:** [benchmark.clickhouse.com](https://benchmark.clickhouse.com/)
+
+ClickHouse는 **디스크 기반 OLAP**에 특화. 인메모리 실시간 HFT와는 직접 비교 부적절하지만 참고:
+
+**ClickHouse 특성:**
+- 벡터화 실행 엔진 (APEX-DB Layer 3과 유사한 아키텍처)
+- MergeTree 스토리지 (APEX-DB DMMT에 영감)
+- 디스크 기반 → 인메모리 대비 쿼리 레이턴시 10~1000x 느림
+- TSBS 벤치마크에서 kdb+ 대비 **기하평균 161x 느림**
+
+**ClickHouse가 잘하는 것:**
+- 대규모 배치 인제스션 (수억 행/초)
+- 디스크 기반 압축 + 스캔 (비용 효율)
+- SQL 호환성, 에코시스템
+
+**ClickHouse가 못하는 것:**
+- 실시간 μs 레이턴시 쿼리 (우리 목표)
+- 틱 단위 스트리밍 인제스션
+- 인메모리 성능 (kdb+, APEX-DB 도메인)
+
+### APEX-DB vs ClickHouse 포지셔닝
+
+| 차원 | ClickHouse | APEX-DB |
+|---|---|---|
+| 타겟 | 범용 OLAP | HFT 실시간 |
+| 스토리지 | 디스크 기반 | 인메모리 (CXL) |
+| 레이턴시 | ms~sec | **μs** |
+| 인제스션 | 배치 최적화 | 스트리밍 최적화 |
+| 쿼리 언어 | SQL | C++ DAG / Python DSL |
+| 경쟁 상대 | Snowflake, BigQuery | kdb+, custom HFT systems |
+
+---
+
+## 4. 결론 및 APEX-DB 목표 수치
+
+### 최종 목표 (Phase B 최적화 후)
+
+| 메트릭 | kdb+ (최신 추정) | APEX-DB 목표 | 전략 |
+|---|---|---|---|
+| 인제스션 | ~5M/sec | **10M+/sec** | RDMA 직접 쓰기, sharded drain |
+| VWAP 1M | ~200-500μs | **<200μs** | SIMD fused pipeline |
+| sum 1M | ~50-150μs | **<100μs** | 멀티컬럼 fusion, prefetch |
+| filter 1M | ~100-300μs | **<200μs** | bitmask SIMD, branch-free |
+| 동적 쿼리 | q 인터프리터 | **JIT SIMD** | LLVM AVX2/512 emit |
+| Python 연동 | PyKX (IPC 기반) | **Zero-copy** | nanobind + Arrow |
+
+### TSBS 대비 목표
+- 단일 쿼리: kdb+ 대비 **1:1 동등 이상**
+- 멀티스레드 쿼리: kdb+ 대비 **2~4x 우위** (kdb+의 단일 스레드 한계 돌파)

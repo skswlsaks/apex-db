@@ -220,14 +220,17 @@ int main() {
     for (size_t rows : {100'000UL, 1'000'000UL, 10'000'000UL}) {
         TestData td(rows);
 
-        // JIT 실행 시간
+        // JIT 실행 시간 — 함수 포인터 직접 호출 (apply 오버헤드 제거)
         volatile size_t jit_count = 0;
         int64_t jit_exec_us = time_us([&]{
-            auto r = jit.apply(filter_fn, td.prices.data(), td.volumes.data(), rows);
-            jit_count = r.size();
+            size_t cnt = 0;
+            for (size_t i = 0; i < rows; ++i) {
+                if (filter_fn(td.prices[i], td.volumes[i])) ++cnt;
+            }
+            jit_count = cnt;
         });
 
-        // C++ 람다 실행 시간
+        // C++ 람다 — 동일한 패턴으로 비교 (인라인됨 → JIT보다 빠를 수 있음)
         volatile size_t cpp_count = 0;
         int64_t cpp_exec_us = time_us([&]{
             size_t cnt = 0;
@@ -237,20 +240,37 @@ int main() {
             cpp_count = cnt;
         });
 
+        // C++ 함수 포인터 (인라인 불가 → JIT과 동일 조건)
+        FilterFn cpp_fptr = +[](int64_t price, int64_t volume) -> bool {
+            return price > 100000 && volume > 5000;
+        };
+        volatile size_t fptr_count = 0;
+        int64_t fptr_exec_us = time_us([&]{
+            size_t cnt = 0;
+            for (size_t i = 0; i < rows; ++i) {
+                if (cpp_fptr(td.prices[i], td.volumes[i])) ++cnt;
+            }
+            fptr_count = cnt;
+        });
+
         std::string rows_str;
         if (rows >= 1'000'000) rows_str = std::to_string(rows / 1'000'000) + "M";
         else rows_str = std::to_string(rows / 1'000) + "K";
 
-        double ratio = static_cast<double>(cpp_exec_us) /
-                       static_cast<double>(jit_exec_us);
+        double jit_vs_inline = static_cast<double>(cpp_exec_us) /
+                               static_cast<double>(jit_exec_us);
+        double jit_vs_fptr = static_cast<double>(fptr_exec_us) /
+                             static_cast<double>(jit_exec_us);
 
         std::cout << "[JIT]  filter " << std::setw(4) << rows_str << " rows:"
                   << "  compile=" << std::setw(6) << compile_us << "μs"
-                  << "  jit_exec=" << std::setw(6) << jit_exec_us << "μs"
-                  << "  cpp_lambda=" << std::setw(6) << cpp_exec_us << "μs"
-                  << "  ratio=" << std::fixed << std::setprecision(2) << ratio << "x"
-                  << "  (matched=" << (jit_count == cpp_count ? "YES" : "NO") << ")\n";
-        (void)jit_count; (void)cpp_count;
+                  << "  jit=" << std::setw(6) << jit_exec_us << "μs"
+                  << "  inline=" << std::setw(6) << cpp_exec_us << "μs"
+                  << "  fptr=" << std::setw(6) << fptr_exec_us << "μs"
+                  << "  jit/inline=" << std::fixed << std::setprecision(2) << jit_vs_inline << "x"
+                  << "  jit/fptr=" << std::fixed << std::setprecision(2) << jit_vs_fptr << "x"
+                  << "  (match=" << (jit_count == cpp_count && cpp_count == fptr_count ? "YES" : "NO") << ")\n";
+        (void)jit_count; (void)cpp_count; (void)fptr_count;
     }
 
     std::cout << "\n=============================================================\n";
