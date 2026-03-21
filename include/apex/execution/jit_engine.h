@@ -8,6 +8,12 @@
 //   "volume * 10 > 5000"
 //   "price > 100 AND volume > 50"
 //   "price > 100 OR volume > 50"
+//
+// Phase B v2 최적화:
+//   - O3 최적화 패스 적용 (기존: OptimizeForSize 속성만 사용 → 사실상 Os)
+//   - alwaysinline: 내부 비교 함수 인라이닝 강제
+//   - compile_bulk: (data*, n) → void 벌크 필터 함수 IR 생성
+//     → JIT 함수를 행당 1번 호출하는 오버헤드 제거
 // ============================================================================
 
 #include <cstdint>
@@ -16,13 +22,17 @@
 #include <string_view>
 #include <vector>
 #include <functional>
-// #include <expected>  // C++23, 아직 사용 안 함
 
 namespace apex::execution {
 
-// 컴파일된 필터 함수 타입
-// params: price, volume (int64_t)
+// 컴파일된 per-row 필터 함수 타입 (v1)
 using FilterFn = bool(*)(int64_t, int64_t);
+
+// 컴파일된 벌크 필터 함수 타입 (v2)
+// void bulk_filter(const int64_t* prices, const int64_t* volumes,
+//                  size_t n, uint32_t* out_indices, size_t* out_count)
+using BulkFilterFn = void(*)(const int64_t*, const int64_t*, size_t,
+                              uint32_t*, size_t*);
 
 // ============================================================================
 // AST 노드 (간단한 재귀하강 파서용)
@@ -69,12 +79,20 @@ public:
     // 초기화 (LLVM 셋업)
     bool initialize();
 
-    // 표현식 → 함수 포인터로 컴파일
+    // ----------------------------------------------------------------
+    // v1 API: 표현식 → per-row 함수 포인터로 컴파일
     // 실패 시 nullptr 반환
+    // ----------------------------------------------------------------
     FilterFn compile(const std::string& expr);
 
-    // 컴파일된 함수를 column data에 적용
-    // 반환: 통과한 행 인덱스 목록
+    // ----------------------------------------------------------------
+    // v2 API: 벌크 필터 함수 컴파일 (O3 + 루프 포함 IR)
+    //   생성 IR: prices[], volumes[], n → out_indices[], *out_count
+    //   → 행당 함수 호출 오버헤드 없음
+    // ----------------------------------------------------------------
+    BulkFilterFn compile_bulk(const std::string& expr);
+
+    // 컴파일된 함수를 column data에 적용 (v1 — 하위 호환)
     std::vector<uint32_t> apply(
         FilterFn fn,
         const int64_t* prices,
