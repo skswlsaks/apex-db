@@ -1,0 +1,5 @@
+if(EXISTS "/home/ec2-user/apex-db/build/tests/apex_tests[1]_tests.cmake")
+  include("/home/ec2-user/apex-db/build/tests/apex_tests[1]_tests.cmake")
+else()
+  add_test(apex_tests_NOT_BUILT apex_tests_NOT_BUILT)
+endif()
