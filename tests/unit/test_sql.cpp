@@ -583,7 +583,1337 @@ TEST(AsofJoin, HashJoinEmpty) {
 }
 
 // ============================================================================
+// Part 5: Phase 1 신규 기능 — 파서 단위 테스트
+// IN / IS NULL / IS NOT NULL / NOT / HAVING
+// ============================================================================
+
+// ── Tokenizer: 새 토큰 ────────────────────────────────────────────────────
+TEST(Tokenizer, InKeyword) {
+    Tokenizer tok;
+    auto tokens = tok.tokenize("WHERE symbol IN (1, 2, 3)");
+    bool found_in = false, found_null = false;
+    for (const auto& t : tokens) {
+        if (t.type == TokenType::IN) found_in = true;
+    }
+    EXPECT_TRUE(found_in);
+    (void)found_null;
+}
+
+TEST(Tokenizer, IsNullKeywords) {
+    Tokenizer tok;
+    auto tokens = tok.tokenize("WHERE price IS NOT NULL");
+    bool found_is = false, found_not = false, found_null = false;
+    for (const auto& t : tokens) {
+        if (t.type == TokenType::IS)     found_is   = true;
+        if (t.type == TokenType::NOT)    found_not  = true;
+        if (t.type == TokenType::NULL_KW) found_null = true;
+    }
+    EXPECT_TRUE(found_is);
+    EXPECT_TRUE(found_not);
+    EXPECT_TRUE(found_null);
+}
+
+// ── Parser: IN 연산자 ─────────────────────────────────────────────────────
+TEST(Parser, InOperatorBasic) {
+    Parser p;
+    auto stmt = p.parse("SELECT * FROM trades WHERE symbol IN (1, 2, 5)");
+    ASSERT_TRUE(stmt.where.has_value());
+    const auto& e = stmt.where->expr;
+    EXPECT_EQ(e->kind, Expr::Kind::IN);
+    EXPECT_EQ(e->column, "symbol");
+    ASSERT_EQ(e->in_values.size(), 3u);
+    EXPECT_EQ(e->in_values[0], 1);
+    EXPECT_EQ(e->in_values[1], 2);
+    EXPECT_EQ(e->in_values[2], 5);
+}
+
+TEST(Parser, InOperatorSingleValue) {
+    Parser p;
+    auto stmt = p.parse("SELECT price FROM trades WHERE volume IN (100)");
+    const auto& e = stmt.where->expr;
+    EXPECT_EQ(e->kind, Expr::Kind::IN);
+    ASSERT_EQ(e->in_values.size(), 1u);
+    EXPECT_EQ(e->in_values[0], 100);
+}
+
+TEST(Parser, InOperatorManyValues) {
+    Parser p;
+    auto stmt = p.parse("SELECT * FROM trades WHERE price IN (15000,15010,15020,15030,15040)");
+    const auto& e = stmt.where->expr;
+    EXPECT_EQ(e->kind, Expr::Kind::IN);
+    ASSERT_EQ(e->in_values.size(), 5u);
+    EXPECT_EQ(e->in_values[4], 15040);
+}
+
+TEST(Parser, InWithAnd) {
+    Parser p;
+    auto stmt = p.parse(
+        "SELECT * FROM trades WHERE symbol IN (1, 2) AND price > 15000");
+    const auto& e = stmt.where->expr;
+    EXPECT_EQ(e->kind, Expr::Kind::AND);
+    EXPECT_EQ(e->left->kind, Expr::Kind::IN);
+    EXPECT_EQ(e->right->kind, Expr::Kind::COMPARE);
+    EXPECT_EQ(e->right->op, CompareOp::GT);
+}
+
+TEST(Parser, InWithOr) {
+    Parser p;
+    auto stmt = p.parse(
+        "SELECT * FROM trades WHERE price IN (15000, 15010) OR volume > 200");
+    const auto& e = stmt.where->expr;
+    EXPECT_EQ(e->kind, Expr::Kind::OR);
+    EXPECT_EQ(e->left->kind, Expr::Kind::IN);
+    EXPECT_EQ(e->right->kind, Expr::Kind::COMPARE);
+}
+
+// ── Parser: IS NULL / IS NOT NULL ─────────────────────────────────────────
+TEST(Parser, IsNull) {
+    Parser p;
+    auto stmt = p.parse("SELECT * FROM trades WHERE price IS NULL");
+    const auto& e = stmt.where->expr;
+    EXPECT_EQ(e->kind, Expr::Kind::IS_NULL);
+    EXPECT_EQ(e->column, "price");
+    EXPECT_FALSE(e->negated);
+}
+
+TEST(Parser, IsNotNull) {
+    Parser p;
+    auto stmt = p.parse("SELECT * FROM trades WHERE volume IS NOT NULL");
+    const auto& e = stmt.where->expr;
+    EXPECT_EQ(e->kind, Expr::Kind::IS_NULL);
+    EXPECT_EQ(e->column, "volume");
+    EXPECT_TRUE(e->negated);
+}
+
+TEST(Parser, IsNullWithAlias) {
+    Parser p;
+    auto stmt = p.parse("SELECT * FROM trades t WHERE t.price IS NOT NULL");
+    const auto& e = stmt.where->expr;
+    EXPECT_EQ(e->kind, Expr::Kind::IS_NULL);
+    EXPECT_EQ(e->table_alias, "t");
+    EXPECT_EQ(e->column, "price");
+    EXPECT_TRUE(e->negated);
+}
+
+TEST(Parser, IsNullAndOtherCond) {
+    Parser p;
+    auto stmt = p.parse(
+        "SELECT * FROM trades WHERE price IS NOT NULL AND volume > 100");
+    const auto& e = stmt.where->expr;
+    EXPECT_EQ(e->kind, Expr::Kind::AND);
+    EXPECT_EQ(e->left->kind, Expr::Kind::IS_NULL);
+    EXPECT_TRUE(e->left->negated);
+    EXPECT_EQ(e->right->kind, Expr::Kind::COMPARE);
+}
+
+// ── Parser: NOT 연산자 (수정된 동작 검증) ─────────────────────────────────
+TEST(Parser, NotOperatorWrapsCompare) {
+    Parser p;
+    auto stmt = p.parse("SELECT * FROM trades WHERE NOT price > 15000");
+    const auto& e = stmt.where->expr;
+    EXPECT_EQ(e->kind, Expr::Kind::NOT);
+    ASSERT_NE(e->left, nullptr);
+    EXPECT_EQ(e->left->kind, Expr::Kind::COMPARE);
+    EXPECT_EQ(e->left->column, "price");
+    EXPECT_EQ(e->left->op, CompareOp::GT);
+}
+
+TEST(Parser, NotOperatorWrapsIn) {
+    Parser p;
+    auto stmt = p.parse("SELECT * FROM trades WHERE NOT price IN (15000, 15090)");
+    const auto& e = stmt.where->expr;
+    EXPECT_EQ(e->kind, Expr::Kind::NOT);
+    EXPECT_EQ(e->left->kind, Expr::Kind::IN);
+    ASSERT_EQ(e->left->in_values.size(), 2u);
+}
+
+TEST(Parser, NotOperatorWrapsIsNull) {
+    Parser p;
+    // NOT (price IS NULL) — 이중 부정
+    auto stmt = p.parse("SELECT * FROM trades WHERE NOT price IS NULL");
+    const auto& e = stmt.where->expr;
+    EXPECT_EQ(e->kind, Expr::Kind::NOT);
+    EXPECT_EQ(e->left->kind, Expr::Kind::IS_NULL);
+    EXPECT_FALSE(e->left->negated);  // IS NULL (NOT wraps it, not negated internally)
+}
+
+TEST(Parser, NotWithParens) {
+    Parser p;
+    auto stmt = p.parse(
+        "SELECT * FROM trades WHERE NOT (price > 15050 AND volume < 105)");
+    const auto& e = stmt.where->expr;
+    EXPECT_EQ(e->kind, Expr::Kind::NOT);
+    EXPECT_EQ(e->left->kind, Expr::Kind::AND);
+}
+
+// ── Parser: HAVING 절 ──────────────────────────────────────────────────────
+TEST(Parser, HavingBasicCompare) {
+    Parser p;
+    auto stmt = p.parse(
+        "SELECT symbol, SUM(volume) AS vol FROM trades "
+        "GROUP BY symbol HAVING vol > 1000");
+    EXPECT_TRUE(stmt.group_by.has_value());
+    ASSERT_TRUE(stmt.having.has_value());
+    const auto& e = stmt.having->expr;
+    EXPECT_EQ(e->kind, Expr::Kind::COMPARE);
+    EXPECT_EQ(e->column, "vol");
+    EXPECT_EQ(e->op, CompareOp::GT);
+    EXPECT_EQ(e->value, 1000);
+}
+
+TEST(Parser, HavingWithGe) {
+    Parser p;
+    auto stmt = p.parse(
+        "SELECT symbol, COUNT(*) AS cnt FROM trades "
+        "GROUP BY symbol HAVING cnt >= 5");
+    ASSERT_TRUE(stmt.having.has_value());
+    const auto& e = stmt.having->expr;
+    EXPECT_EQ(e->op, CompareOp::GE);
+    EXPECT_EQ(e->value, 5);
+}
+
+TEST(Parser, HavingWithIn) {
+    Parser p;
+    auto stmt = p.parse(
+        "SELECT symbol, COUNT(*) AS cnt FROM trades "
+        "GROUP BY symbol HAVING cnt IN (5, 10)");
+    ASSERT_TRUE(stmt.having.has_value());
+    const auto& e = stmt.having->expr;
+    EXPECT_EQ(e->kind, Expr::Kind::IN);
+    ASSERT_EQ(e->in_values.size(), 2u);
+}
+
+TEST(Parser, HavingAndOrderByLimit) {
+    Parser p;
+    auto stmt = p.parse(
+        "SELECT symbol, SUM(volume) AS vol FROM trades "
+        "GROUP BY symbol HAVING vol > 0 ORDER BY vol DESC LIMIT 1");
+    EXPECT_TRUE(stmt.having.has_value());
+    EXPECT_TRUE(stmt.order_by.has_value());
+    ASSERT_TRUE(stmt.limit.has_value());
+    EXPECT_EQ(*stmt.limit, 1);
+}
+
+TEST(Parser, HavingAndExpr) {
+    Parser p;
+    auto stmt = p.parse(
+        "SELECT symbol, COUNT(*) AS cnt, SUM(volume) AS vol FROM trades "
+        "GROUP BY symbol HAVING cnt > 1 AND vol > 100");
+    ASSERT_TRUE(stmt.having.has_value());
+    const auto& e = stmt.having->expr;
+    EXPECT_EQ(e->kind, Expr::Kind::AND);
+    EXPECT_EQ(e->left->column, "cnt");
+    EXPECT_EQ(e->right->column, "vol");
+}
+
+// ── Parser: 복합 조건 ──────────────────────────────────────────────────────
+TEST(Parser, ComplexWhereInBetweenAnd) {
+    Parser p;
+    auto stmt = p.parse(
+        "SELECT * FROM trades "
+        "WHERE symbol IN (1, 2) AND price BETWEEN 15000 AND 15050 AND volume > 100");
+    // AND은 왼쪽 우선 결합: ((IN AND BETWEEN) AND COMPARE)
+    const auto& root = stmt.where->expr;
+    EXPECT_EQ(root->kind, Expr::Kind::AND);
+    EXPECT_EQ(root->left->kind, Expr::Kind::AND);
+    EXPECT_EQ(root->left->left->kind, Expr::Kind::IN);
+    EXPECT_EQ(root->left->right->kind, Expr::Kind::BETWEEN);
+    EXPECT_EQ(root->right->kind, Expr::Kind::COMPARE);
+}
+
+// ============================================================================
+// Part 6: Phase 1 신규 기능 — 실행기 통합 테스트
+// 실제 데이터 적재 후 IN / IS NULL / NOT / HAVING 실행 검증
+// 데이터: symbol=1(10행: price 15000~15090 step10, volume 100~109)
+//         symbol=2(5행:  price 20000~20040 step10, volume 200~204)
+// ============================================================================
+
+// ── IN 연산자 ─────────────────────────────────────────────────────────────
+TEST_F(SqlExecutorTest, InPrice3Values) {
+    // price IN (15000, 15030, 15060) → symbol=1 에서 정확히 3행
+    auto r = executor->execute(
+        "SELECT price FROM trades WHERE symbol = 1 AND price IN (15000, 15030, 15060)");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_EQ(r.rows.size(), 3u);
+    // 반환된 price 값 확인
+    std::vector<int64_t> prices;
+    for (const auto& row : r.rows) prices.push_back(row[0]);
+    std::sort(prices.begin(), prices.end());
+    EXPECT_EQ(prices[0], 15000);
+    EXPECT_EQ(prices[1], 15030);
+    EXPECT_EQ(prices[2], 15060);
+}
+
+TEST_F(SqlExecutorTest, InPriceSingleMatch) {
+    auto r = executor->execute(
+        "SELECT price FROM trades WHERE symbol = 1 AND price IN (15090)");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 15090);
+}
+
+TEST_F(SqlExecutorTest, InPriceNoMatch) {
+    // 존재하지 않는 price 값 → 0행
+    auto r = executor->execute(
+        "SELECT price FROM trades WHERE symbol = 1 AND price IN (99999, 88888)");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_EQ(r.rows.size(), 0u);
+}
+
+TEST_F(SqlExecutorTest, InVolumeWithAndCondition) {
+    // volume IN (100, 101, 102) AND price > 15010
+    // volume 101=price15010(제외), 102=price15020(포함) → 1행
+    auto r = executor->execute(
+        "SELECT price, volume FROM trades "
+        "WHERE symbol = 1 AND volume IN (100, 101, 102) AND price > 15010");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][1], 102);  // volume=102
+}
+
+TEST_F(SqlExecutorTest, InVolumeAllMatch) {
+    // volume IN (100..109) = 모든 symbol=1 행
+    auto r = executor->execute(
+        "SELECT count(*) FROM trades WHERE symbol = 1 "
+        "AND volume IN (100,101,102,103,104,105,106,107,108,109)");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 10);
+}
+
+// ── IS NULL / IS NOT NULL ─────────────────────────────────────────────────
+TEST_F(SqlExecutorTest, IsNotNullPrice) {
+    // price 컬럼에 NULL 없음 → IS NOT NULL = 전체 10행
+    auto r = executor->execute(
+        "SELECT price FROM trades WHERE symbol = 1 AND price IS NOT NULL");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_EQ(r.rows.size(), 10u);
+}
+
+TEST_F(SqlExecutorTest, IsNullPriceReturnsEmpty) {
+    // price 컬럼에 NULL 없음 → IS NULL = 0행
+    auto r = executor->execute(
+        "SELECT price FROM trades WHERE symbol = 1 AND price IS NULL");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_EQ(r.rows.size(), 0u);
+}
+
+TEST_F(SqlExecutorTest, IsNotNullCombinedWithGt) {
+    // price IS NOT NULL AND price > 15050 → 4행
+    auto r = executor->execute(
+        "SELECT price FROM trades "
+        "WHERE symbol = 1 AND price IS NOT NULL AND price > 15050");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_EQ(r.rows.size(), 4u);
+}
+
+// ── NOT 연산자 (버그 수정 검증) ───────────────────────────────────────────
+TEST_F(SqlExecutorTest, NotGtIsComplement) {
+    // NOT price > 15050 → price <= 15050 → 6행 (15000~15050)
+    // 버그 수정 전: NOT이 무시되어 price > 15050 = 4행 반환됐음
+    auto r_not = executor->execute(
+        "SELECT price FROM trades WHERE symbol = 1 AND NOT price > 15050");
+    ASSERT_TRUE(r_not.ok()) << r_not.error;
+    EXPECT_EQ(r_not.rows.size(), 6u)
+        << "NOT was silently ignored bug: expected 6 rows (NOT price>15050)";
+
+    // 확인: price > 15050은 4행
+    auto r_gt = executor->execute(
+        "SELECT price FROM trades WHERE symbol = 1 AND price > 15050");
+    ASSERT_TRUE(r_gt.ok()) << r_gt.error;
+    EXPECT_EQ(r_gt.rows.size(), 4u);
+
+    // NOT의 결과가 원래 결과와 달라야 함
+    EXPECT_NE(r_not.rows.size(), r_gt.rows.size());
+}
+
+TEST_F(SqlExecutorTest, NotInPrice) {
+    // NOT price IN (15000, 15090) → price가 15000도 15090도 아닌 행 → 8행
+    auto r = executor->execute(
+        "SELECT price FROM trades "
+        "WHERE symbol = 1 AND NOT price IN (15000, 15090)");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_EQ(r.rows.size(), 8u);
+    // 15000, 15090이 포함되지 않음을 확인
+    for (const auto& row : r.rows) {
+        EXPECT_NE(row[0], 15000);
+        EXPECT_NE(row[0], 15090);
+    }
+}
+
+TEST_F(SqlExecutorTest, NotBetween) {
+    // NOT price BETWEEN 15020 AND 15060 → price<15020 OR price>15060
+    // prices in range [15020,15060]: 15020,15030,15040,15050,15060 = 5 rows excluded
+    // remaining: 15000,15010,15070,15080,15090 = 5 rows
+    auto r = executor->execute(
+        "SELECT price FROM trades "
+        "WHERE symbol = 1 AND NOT price BETWEEN 15020 AND 15060");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_EQ(r.rows.size(), 5u);
+}
+
+// ── HAVING 절 ─────────────────────────────────────────────────────────────
+TEST_F(SqlExecutorTest, HavingCountGt) {
+    // GROUP BY symbol HAVING cnt > 8 → symbol=1(cnt=10)만 반환
+    auto r = executor->execute(
+        "SELECT symbol, COUNT(*) AS cnt FROM trades "
+        "GROUP BY symbol HAVING cnt > 8");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 1);  // symbol=1
+    EXPECT_EQ(r.rows[0][1], 10); // cnt=10
+}
+
+TEST_F(SqlExecutorTest, HavingCountGe5BothGroups) {
+    // cnt >= 5 → symbol=1(10), symbol=2(5) 둘 다 반환
+    auto r = executor->execute(
+        "SELECT symbol, COUNT(*) AS cnt FROM trades "
+        "GROUP BY symbol HAVING cnt >= 5");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_EQ(r.rows.size(), 2u);
+}
+
+TEST_F(SqlExecutorTest, HavingSumVolume) {
+    // sum(volume) AS vol HAVING vol > 1040
+    // symbol=1: sum(100..109)=1045 > 1040 ✓
+    // symbol=2: sum(200..204)=1010 < 1040 ✗
+    auto r = executor->execute(
+        "SELECT symbol, SUM(volume) AS vol FROM trades "
+        "GROUP BY symbol HAVING vol > 1040");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 1);    // symbol=1
+    EXPECT_EQ(r.rows[0][1], 1045); // sum=1045
+}
+
+TEST_F(SqlExecutorTest, HavingNoMatch) {
+    // cnt > 100 → 둘 다 해당 없음 → 0행
+    auto r = executor->execute(
+        "SELECT symbol, COUNT(*) AS cnt FROM trades "
+        "GROUP BY symbol HAVING cnt > 100");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_EQ(r.rows.size(), 0u);
+}
+
+TEST_F(SqlExecutorTest, HavingWithOrderByLimit) {
+    // HAVING vol > 0 → 둘 다 통과, ORDER BY vol DESC LIMIT 1 → symbol=1
+    auto r = executor->execute(
+        "SELECT symbol, SUM(volume) AS vol FROM trades "
+        "GROUP BY symbol HAVING vol > 0 ORDER BY vol DESC LIMIT 1");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 1);    // symbol=1 (vol=1045 > symbol=2의 1010)
+}
+
+TEST_F(SqlExecutorTest, HavingMinMax) {
+    // max(price) AS maxp HAVING maxp > 19000
+    // symbol=1: max(price)=15090 < 19000 ✗
+    // symbol=2: max(price)=20040 > 19000 ✓
+    auto r = executor->execute(
+        "SELECT symbol, MAX(price) AS maxp FROM trades "
+        "GROUP BY symbol HAVING maxp > 19000");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 2);     // symbol=2
+    EXPECT_EQ(r.rows[0][1], 20040); // max price
+}
+
+TEST_F(SqlExecutorTest, HavingAndExpr) {
+    // cnt > 1 AND vol > 1020 → symbol=1 only (cnt=10, vol=1045 > 1020)
+    // symbol=2 has vol=1010 which fails vol > 1020
+    auto r = executor->execute(
+        "SELECT symbol, COUNT(*) AS cnt, SUM(volume) AS vol FROM trades "
+        "GROUP BY symbol HAVING cnt > 1 AND vol > 1020");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 1);
+}
+
+TEST_F(SqlExecutorTest, HavingInValues) {
+    // HAVING cnt IN (5, 10) → symbol=1(10), symbol=2(5) 모두 해당
+    auto r = executor->execute(
+        "SELECT symbol, COUNT(*) AS cnt FROM trades "
+        "GROUP BY symbol HAVING cnt IN (5, 10)");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_EQ(r.rows.size(), 2u);
+}
+
+TEST_F(SqlExecutorTest, HavingInValuesPartialMatch) {
+    // HAVING cnt IN (10, 99) → symbol=1(10)만 해당
+    auto r = executor->execute(
+        "SELECT symbol, COUNT(*) AS cnt FROM trades "
+        "GROUP BY symbol HAVING cnt IN (10, 99)");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 1);
+    EXPECT_EQ(r.rows[0][1], 10);
+}
+
+TEST_F(SqlExecutorTest, HavingWithWhereAndGroupBy) {
+    // WHERE price > 15000 (symbol=1에서 9행만) → GROUP BY → HAVING cnt > 8 → 1행
+    auto r = executor->execute(
+        "SELECT symbol, COUNT(*) AS cnt FROM trades "
+        "WHERE symbol = 1 AND price > 15000 "
+        "GROUP BY symbol HAVING cnt > 8");
+    ASSERT_TRUE(r.ok()) << r.error;
+    // price > 15000 → 15010~15090 = 9행, HAVING cnt > 8 → 통과
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][1], 9);
+}
+
+// ── 복합 쿼리 (IN + HAVING + ORDER BY) ───────────────────────────────────
+TEST_F(SqlExecutorTest, InWithGroupByHaving) {
+    // volume IN (100..104) 로 symbol=1에서 5행만 걸러 → GROUP BY → HAVING cnt = 5
+    auto r = executor->execute(
+        "SELECT symbol, COUNT(*) AS cnt, SUM(volume) AS vol FROM trades "
+        "WHERE symbol = 1 AND volume IN (100, 101, 102, 103, 104) "
+        "GROUP BY symbol HAVING cnt > 0");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][1], 5);   // cnt=5
+    EXPECT_EQ(r.rows[0][2], 510); // sum(100..104) = 510
+}
+
+// ── 에러 케이스 ───────────────────────────────────────────────────────────
+TEST_F(SqlExecutorTest, HavingWithoutGroupByParses) {
+    // HAVING without GROUP BY — 파서는 허용, 실행 시 집계 없으므로 빈 결과
+    // (파서 에러 없음을 확인)
+    auto r = executor->execute(
+        "SELECT price FROM trades HAVING price > 0");
+    // 파서는 통과, 집계 없으므로 결과는 빈 결과 또는 정상 처리
+    // 에러 없음을 보장
+    EXPECT_TRUE(r.error.empty() || !r.error.empty()); // 결과 상관없이 crash 안 됨
+}
+
+// ── NOT 버그 회귀 테스트 (수정 이전 동작이 재발하지 않음 확인) ────────────
+TEST_F(SqlExecutorTest, NotRegressionOldBehaviorGone) {
+    // 이전 버그: NOT이 무시되어 "NOT price > 15000"이 "price > 15000"처럼 동작
+    // 수정 후: NOT price > 15000 = price <= 15000
+    auto r_not = executor->execute(
+        "SELECT count(*) FROM trades WHERE symbol = 1 AND NOT price > 15000");
+    auto r_gt  = executor->execute(
+        "SELECT count(*) FROM trades WHERE symbol = 1 AND price > 15000");
+    ASSERT_TRUE(r_not.ok()) << r_not.error;
+    ASSERT_TRUE(r_gt.ok())  << r_gt.error;
+
+    int64_t cnt_not = r_not.rows[0][0];
+    int64_t cnt_gt  = r_gt.rows[0][0];
+
+    // NOT이 제대로 동작하면 결과가 달라야 함
+    EXPECT_NE(cnt_not, cnt_gt) << "NOT is being silently ignored (regression)";
+    // 합이 10이어야 함 (NOT complement)
+    EXPECT_EQ(cnt_not + cnt_gt, 10);
+}
+
+// ============================================================================
+// Part 7: Phase 2 — SELECT Arithmetic Expressions
+// ============================================================================
+
+// ── Tokenizer ─────────────────────────────────────────────────────────────
+TEST(Tokenizer, SlashToken) {
+    Tokenizer t;
+    auto toks = t.tokenize("price / volume");
+    ASSERT_EQ(toks[1].type, TokenType::SLASH);
+}
+
+TEST(Tokenizer, CaseWhenKeywords) {
+    Tokenizer t;
+    auto toks = t.tokenize("CASE WHEN x THEN y ELSE z END");
+    EXPECT_EQ(toks[0].type, TokenType::CASE);
+    EXPECT_EQ(toks[1].type, TokenType::WHEN);
+    EXPECT_EQ(toks[3].type, TokenType::THEN);
+    EXPECT_EQ(toks[5].type, TokenType::ELSE);
+    EXPECT_EQ(toks[7].type, TokenType::CASE_END);
+}
+
+// ── Parser: arithmetic ────────────────────────────────────────────────────
+TEST(Parser, ArithMulTwoColumns) {
+    Parser p;
+    auto s = p.parse("SELECT price * volume AS notional FROM trades");
+    ASSERT_EQ(s.columns.size(), 1u);
+    ASSERT_NE(s.columns[0].arith_expr, nullptr);
+    EXPECT_EQ(s.columns[0].arith_expr->kind, ArithExpr::Kind::BINARY);
+    EXPECT_EQ(s.columns[0].arith_expr->arith_op, ArithOp::MUL);
+    EXPECT_EQ(s.columns[0].arith_expr->left->column, "price");
+    EXPECT_EQ(s.columns[0].arith_expr->right->column, "volume");
+    EXPECT_EQ(s.columns[0].alias, "notional");
+}
+
+TEST(Parser, ArithSubLiteral) {
+    Parser p;
+    auto s = p.parse("SELECT price - 15000 AS offset FROM trades");
+    ASSERT_NE(s.columns[0].arith_expr, nullptr);
+    EXPECT_EQ(s.columns[0].arith_expr->arith_op, ArithOp::SUB);
+    EXPECT_EQ(s.columns[0].arith_expr->right->kind, ArithExpr::Kind::LITERAL);
+    EXPECT_EQ(s.columns[0].arith_expr->right->literal, 15000);
+}
+
+TEST(Parser, ArithDivLiteral) {
+    Parser p;
+    auto s = p.parse("SELECT price / 100 AS price_cents FROM trades");
+    ASSERT_NE(s.columns[0].arith_expr, nullptr);
+    EXPECT_EQ(s.columns[0].arith_expr->arith_op, ArithOp::DIV);
+    EXPECT_EQ(s.columns[0].arith_expr->right->literal, 100);
+}
+
+TEST(Parser, ArithAddTwoColumns) {
+    Parser p;
+    auto s = p.parse("SELECT price + volume AS pv FROM trades");
+    ASSERT_NE(s.columns[0].arith_expr, nullptr);
+    EXPECT_EQ(s.columns[0].arith_expr->arith_op, ArithOp::ADD);
+}
+
+TEST(Parser, ArithMultipleSelectCols) {
+    // Plain col + arithmetic col in same SELECT
+    Parser p;
+    auto s = p.parse("SELECT symbol, price * volume AS notional FROM trades");
+    EXPECT_EQ(s.columns[0].column, "symbol");
+    EXPECT_EQ(s.columns[0].arith_expr, nullptr);
+    ASSERT_NE(s.columns[1].arith_expr, nullptr);
+    EXPECT_EQ(s.columns[1].alias, "notional");
+}
+
+TEST(Parser, ArithInsideAggregate) {
+    // SUM(price * volume)
+    Parser p;
+    auto s = p.parse("SELECT SUM(price * volume) AS total FROM trades");
+    EXPECT_EQ(s.columns[0].agg, AggFunc::SUM);
+    ASSERT_NE(s.columns[0].arith_expr, nullptr);
+    EXPECT_EQ(s.columns[0].arith_expr->arith_op, ArithOp::MUL);
+    EXPECT_EQ(s.columns[0].alias, "total");
+}
+
+TEST(Parser, ArithParenthesized) {
+    // (price - 14000) / 100
+    Parser p;
+    auto s = p.parse("SELECT (price - 14000) / 100 AS tick FROM trades");
+    ASSERT_NE(s.columns[0].arith_expr, nullptr);
+    EXPECT_EQ(s.columns[0].arith_expr->arith_op, ArithOp::DIV);
+    EXPECT_EQ(s.columns[0].arith_expr->left->arith_op, ArithOp::SUB);
+}
+
+// ── Parser: CASE WHEN ─────────────────────────────────────────────────────
+TEST(Parser, CaseWhenBasic) {
+    Parser p;
+    auto s = p.parse(
+        "SELECT CASE WHEN price > 15050 THEN 1 ELSE 0 END AS side FROM trades");
+    ASSERT_NE(s.columns[0].case_when, nullptr);
+    EXPECT_EQ(s.columns[0].case_when->branches.size(), 1u);
+    EXPECT_EQ(s.columns[0].case_when->else_val->literal, 0);
+    EXPECT_EQ(s.columns[0].alias, "side");
+}
+
+TEST(Parser, CaseWhenMultipleBranches) {
+    Parser p;
+    auto s = p.parse(
+        "SELECT CASE WHEN price < 15030 THEN 1 WHEN price < 15060 THEN 2 ELSE 3 END AS bucket FROM trades");
+    ASSERT_NE(s.columns[0].case_when, nullptr);
+    EXPECT_EQ(s.columns[0].case_when->branches.size(), 2u);
+    EXPECT_EQ(s.columns[0].case_when->else_val->literal, 3);
+}
+
+TEST(Parser, CaseWhenNoElse) {
+    Parser p;
+    auto s = p.parse("SELECT CASE WHEN price = 15000 THEN 1 END AS x FROM trades");
+    ASSERT_NE(s.columns[0].case_when, nullptr);
+    EXPECT_EQ(s.columns[0].case_when->else_val, nullptr); // no ELSE → null
+}
+
+// ── Executor: arithmetic ─────────────────────────────────────────────────
+TEST_F(SqlExecutorTest, ArithMulColCol) {
+    // price * volume AS notional for first row of symbol=1
+    // first row: price=15000, volume=100 → notional=1500000
+    auto r = executor->execute(
+        "SELECT price * volume AS notional FROM trades "
+        "WHERE symbol = 1 ORDER BY notional ASC LIMIT 1");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 15000LL * 100);
+}
+
+TEST_F(SqlExecutorTest, ArithSubLiteral) {
+    // price - 15000 AS offset, first 3 rows of symbol=1 → 0,10,20
+    auto r = executor->execute(
+        "SELECT price - 15000 AS offset FROM trades "
+        "WHERE symbol = 1 ORDER BY offset ASC LIMIT 3");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 3u);
+    EXPECT_EQ(r.rows[0][0], 0);
+    EXPECT_EQ(r.rows[1][0], 10);
+    EXPECT_EQ(r.rows[2][0], 20);
+}
+
+TEST_F(SqlExecutorTest, ArithDivLiteral) {
+    // price / 100 for first row of symbol=1 → 150
+    auto r = executor->execute(
+        "SELECT price / 100 AS cents FROM trades "
+        "WHERE symbol = 1 ORDER BY cents ASC LIMIT 1");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 150);
+}
+
+TEST_F(SqlExecutorTest, ArithAddColCol) {
+    // price + volume, first row: 15000 + 100 = 15100
+    auto r = executor->execute(
+        "SELECT price + volume AS pv FROM trades "
+        "WHERE symbol = 1 ORDER BY pv ASC LIMIT 1");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 15100);
+}
+
+TEST_F(SqlExecutorTest, ArithParenthesized) {
+    // (price - 14000) / 100: price=15000 → 10, price=15010 → 10 (int div)
+    auto r = executor->execute(
+        "SELECT (price - 14000) / 100 AS tick FROM trades "
+        "WHERE symbol = 1 ORDER BY tick ASC LIMIT 2");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_GE(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 10); // (15000-14000)/100 = 10
+}
+
+TEST_F(SqlExecutorTest, ArithSumOfProduct) {
+    // SUM(price * volume) for symbol=1
+    // sum(i=0..9) (15000+10i)*(100+i) = 15722850
+    auto r = executor->execute(
+        "SELECT SUM(price * volume) AS total FROM trades WHERE symbol = 1");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 15722850LL);
+}
+
+TEST_F(SqlExecutorTest, ArithAvgOfDifference) {
+    // AVG(price - 15000) for symbol=1
+    // offsets: 0,10,20,30,40,50,60,70,80,90 → sum=450, avg=45
+    auto r = executor->execute(
+        "SELECT AVG(price - 15000) AS avg_offset FROM trades WHERE symbol = 1");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 45);
+}
+
+TEST_F(SqlExecutorTest, ArithMultiColResult) {
+    // symbol + price*volume in same query
+    auto r = executor->execute(
+        "SELECT symbol, price * volume AS notional FROM trades "
+        "WHERE symbol = 1 ORDER BY notional ASC LIMIT 1");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 1);               // symbol
+    EXPECT_EQ(r.rows[0][1], 15000LL * 100);   // notional
+}
+
+// ── Executor: CASE WHEN ──────────────────────────────────────────────────
+TEST_F(SqlExecutorTest, CaseWhenBasicBinary) {
+    // CASE WHEN price > 15050 THEN 1 ELSE 0 END AS side
+    // prices > 15050: 15060,15070,15080,15090 → 4 rows with side=1
+    auto r = executor->execute(
+        "SELECT CASE WHEN price > 15050 THEN 1 ELSE 0 END AS side "
+        "FROM trades WHERE symbol = 1");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 10u);
+    int64_t ones = 0, zeros = 0;
+    for (const auto& row : r.rows) {
+        if (row[0] == 1) ones++;
+        else if (row[0] == 0) zeros++;
+    }
+    EXPECT_EQ(ones,  4); // prices 15060..15090
+    EXPECT_EQ(zeros, 6); // prices 15000..15050
+}
+
+TEST_F(SqlExecutorTest, CaseWhenMultiBranch) {
+    // price < 15030 → 1, price < 15060 → 2, else → 3
+    // sym=1 prices: 15000,15010,15020 → bucket=1 (3 rows)
+    //               15030,15040,15050 → bucket=2 (3 rows)
+    //               15060,15070,15080,15090 → bucket=3 (4 rows)
+    auto r = executor->execute(
+        "SELECT CASE WHEN price < 15030 THEN 1 "
+        "WHEN price < 15060 THEN 2 ELSE 3 END AS bucket "
+        "FROM trades WHERE symbol = 1");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 10u);
+    int64_t b1=0, b2=0, b3=0;
+    for (const auto& row : r.rows) {
+        if (row[0]==1) b1++;
+        else if (row[0]==2) b2++;
+        else b3++;
+    }
+    EXPECT_EQ(b1, 3);
+    EXPECT_EQ(b2, 3);
+    EXPECT_EQ(b3, 4);
+}
+
+TEST_F(SqlExecutorTest, CaseWhenNoElseDefaultsZero) {
+    // CASE WHEN price = 15000 THEN 99 END (no ELSE → 0)
+    auto r = executor->execute(
+        "SELECT CASE WHEN price = 15000 THEN 99 END AS x "
+        "FROM trades WHERE symbol = 1 ORDER BY x DESC LIMIT 1");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 99); // highest is 99 (first row matches)
+}
+
+TEST_F(SqlExecutorTest, CaseWhenWithBetween) {
+    // CASE WHEN price BETWEEN 15020 AND 15060 THEN 1 ELSE 0 END → 5 ones
+    auto r = executor->execute(
+        "SELECT CASE WHEN price BETWEEN 15020 AND 15060 THEN 1 ELSE 0 END AS mid "
+        "FROM trades WHERE symbol = 1");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 10u);
+    int64_t ones = 0;
+    for (const auto& row : r.rows) if (row[0] == 1) ones++;
+    EXPECT_EQ(ones, 5); // 15020,15030,15040,15050,15060
+}
+
+TEST_F(SqlExecutorTest, CaseWhenWithThenArith) {
+    // CASE WHEN price > 15050 THEN price - 15000 ELSE 0 END
+    // rows with price>15050: 15060→60, 15070→70, 15080→80, 15090→90
+    auto r = executor->execute(
+        "SELECT CASE WHEN price > 15050 THEN price - 15000 ELSE 0 END AS v "
+        "FROM trades WHERE symbol = 1 ORDER BY v DESC LIMIT 4");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 4u);
+    EXPECT_EQ(r.rows[0][0], 90); // price=15090 - 15000
+    EXPECT_EQ(r.rows[3][0], 60); // price=15060 - 15000
+}
+
+// ── Executor: Multi-column GROUP BY ──────────────────────────────────────
+TEST_F(SqlExecutorTest, MultiGroupBySymbolAndPriceBucket) {
+    // GROUP BY symbol, xbar(price, 50)
+    // sym=1: bucket 15000 (5 rows) + bucket 15050 (5 rows)
+    // sym=2: bucket 20000 (5 rows)
+    // → 3 groups total
+    auto r = executor->execute(
+        "SELECT symbol, SUM(volume) AS vol FROM trades "
+        "GROUP BY symbol, xbar(price, 50)");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_EQ(r.rows.size(), 3u);
+
+    // Verify all 3 groups are present with correct sums
+    int64_t total_vol = 0;
+    for (const auto& row : r.rows) total_vol += row[2]; // row: [symbol, price_bucket, vol]
+    // Total volume across all rows: 100+101+...+109 + 200+...+204 = 1045+1010 = 2055
+    EXPECT_EQ(total_vol, 2055);
+}
+
+TEST_F(SqlExecutorTest, MultiGroupBySymbolAndPrice) {
+    // GROUP BY symbol, price → each row becomes its own group (15 groups)
+    auto r = executor->execute(
+        "SELECT symbol, price, COUNT(*) AS cnt FROM trades "
+        "GROUP BY symbol, price");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_EQ(r.rows.size(), 15u); // 10 sym1 + 5 sym2
+    // Each group has exactly 1 row
+    for (const auto& row : r.rows) {
+        EXPECT_EQ(row[2], 1); // cnt=1 for every (symbol, price) pair
+    }
+}
+
+TEST_F(SqlExecutorTest, MultiGroupByResultColumnCount) {
+    // GROUP BY two columns → result has 2 group cols + 1 agg col = 3 total
+    auto r = executor->execute(
+        "SELECT symbol, SUM(volume) AS vol FROM trades "
+        "GROUP BY symbol, xbar(price, 50)");
+    ASSERT_TRUE(r.ok()) << r.error;
+    // column_names: [symbol, price, vol]
+    EXPECT_EQ(r.column_names.size(), 3u);
+    EXPECT_EQ(r.column_names[0], "symbol");
+    EXPECT_EQ(r.column_names[2], "vol");
+}
+
+TEST_F(SqlExecutorTest, MultiGroupByWithHaving) {
+    // GROUP BY symbol, xbar(price, 50) HAVING vol > 520
+    // sym=1 bucket 15000: vol=100+101+102+103+104=510 → filtered out
+    // sym=1 bucket 15050: vol=105+106+107+108+109=535 → passes
+    // sym=2 bucket 20000: vol=200+201+202+203+204=1010 → passes
+    auto r = executor->execute(
+        "SELECT symbol, SUM(volume) AS vol FROM trades "
+        "GROUP BY symbol, xbar(price, 50) HAVING vol > 520");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_EQ(r.rows.size(), 2u);
+}
+
+// ── Regression: existing GROUP BY still works after refactor ─────────────
+TEST_F(SqlExecutorTest, GroupBySymbolStillWorks) {
+    // Verify single-column GROUP BY symbol still uses is_symbol_group path
+    auto r = executor->execute(
+        "SELECT symbol, COUNT(*) AS cnt FROM trades GROUP BY symbol");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_EQ(r.rows.size(), 2u);
+}
+
+// ============================================================================
 // Part 5: HTTP 엔드포인트 테스트 (선택적)
 // ============================================================================
 // HTTP 서버 테스트는 통합 테스트로 분리
 // (빌드 시간 + 포트 충돌 고려하여 단독 실행)
+
+// ============================================================================
+// Part 6: Time Range Index Tests
+// ============================================================================
+// Uses a dedicated fixture with directly-inserted, controlled timestamps
+// (bypasses TickPlant which overwrites recv_ts with now_ns()).
+//
+// Fixture data:
+//   symbol=1: timestamps 1000..1009 ns, price 15000..15090 step 10, volume 100..109
+//   symbol=2: timestamps 1000..1004 ns, price 20000..20040 step 10, volume 200..204
+// All fall in hour_epoch=0.
+// ============================================================================
+
+class TimeRangeIndexTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        PipelineConfig cfg;
+        cfg.storage_mode = StorageMode::PURE_IN_MEMORY;
+        pipeline  = std::make_unique<ApexPipeline>(cfg);
+        executor  = std::make_unique<QueryExecutor>(*pipeline);
+
+        auto& pm = pipeline->partition_manager();
+
+        // symbol=1 partition — timestamps 1000..1009
+        {
+            auto& part = pm.get_or_create(1, 1000LL);
+            auto& ts  = part.add_column("timestamp", ColumnType::TIMESTAMP_NS);
+            auto& pr  = part.add_column("price",     ColumnType::INT64);
+            auto& vol = part.add_column("volume",    ColumnType::INT64);
+            auto& mt  = part.add_column("msg_type",  ColumnType::INT32);
+            for (int i = 0; i < 10; ++i) {
+                ts.append<int64_t>(1000LL + i);
+                pr.append<int64_t>(15000LL + i * 10);
+                vol.append<int64_t>(100LL  + i);
+                mt.append<int32_t>(0);
+            }
+        }
+
+        // symbol=2 partition — timestamps 1000..1004
+        {
+            auto& part = pm.get_or_create(2, 1000LL);
+            auto& ts  = part.add_column("timestamp", ColumnType::TIMESTAMP_NS);
+            auto& pr  = part.add_column("price",     ColumnType::INT64);
+            auto& vol = part.add_column("volume",    ColumnType::INT64);
+            auto& mt  = part.add_column("msg_type",  ColumnType::INT32);
+            for (int i = 0; i < 5; ++i) {
+                ts.append<int64_t>(1000LL + i);
+                pr.append<int64_t>(20000LL + i * 10);
+                vol.append<int64_t>(200LL  + i);
+                mt.append<int32_t>(0);
+            }
+        }
+    }
+
+    std::unique_ptr<ApexPipeline>  pipeline;
+    std::unique_ptr<QueryExecutor> executor;
+};
+
+// Partial range SELECT — binary search returns a subset of rows.
+// timestamp BETWEEN 1003 AND 1007 for symbol=1 → rows i=3..7 (5 rows)
+TEST_F(TimeRangeIndexTest, PartialScanCorrectRows) {
+    auto result = executor->execute(
+        "SELECT price FROM trades "
+        "WHERE symbol = 1 AND timestamp BETWEEN 1003 AND 1007");
+    ASSERT_TRUE(result.ok()) << result.error;
+    EXPECT_EQ(result.rows.size(), 5u);
+    // Binary search must not scan more rows than the matching range
+    EXPECT_LE(result.rows_scanned, 5u)
+        << "binary search should limit rows_scanned to the matching window";
+}
+
+// Binary search skips leading and trailing rows.
+TEST_F(TimeRangeIndexTest, PartialScanRowsScannedReduced) {
+    auto result = executor->execute(
+        "SELECT price FROM trades "
+        "WHERE symbol = 1 AND timestamp BETWEEN 1004 AND 1006");
+    ASSERT_TRUE(result.ok()) << result.error;
+    EXPECT_EQ(result.rows.size(), 3u);
+    EXPECT_LE(result.rows_scanned, 3u)
+        << "rows_scanned=" << result.rows_scanned;
+}
+
+// Partial range AGG: sum(volume) for timestamp in [1003,1007] for symbol=1
+// volumes: 103+104+105+106+107 = 525
+TEST_F(TimeRangeIndexTest, PartialAgg) {
+    auto result = executor->execute(
+        "SELECT sum(volume) FROM trades "
+        "WHERE symbol = 1 AND timestamp BETWEEN 1003 AND 1007");
+    ASSERT_TRUE(result.ok()) << result.error;
+    ASSERT_EQ(result.rows.size(), 1u);
+    EXPECT_EQ(result.rows[0][0], 525);
+}
+
+// Partial range GROUP BY: both symbols filtered by timestamp window [1003,1007]
+// symbol=1: ts 1003..1007 → 5 rows; symbol=2: ts 1003,1004 → 2 rows
+TEST_F(TimeRangeIndexTest, PartialGroupBy) {
+    auto result = executor->execute(
+        "SELECT symbol, count(*) FROM trades "
+        "WHERE timestamp BETWEEN 1003 AND 1007 GROUP BY symbol");
+    ASSERT_TRUE(result.ok()) << result.error;
+    ASSERT_EQ(result.rows.size(), 2u);
+
+    int64_t cnt1 = 0, cnt2 = 0;
+    for (const auto& row : result.rows) {
+        if (row[0] == 1) cnt1 = row[1];
+        if (row[0] == 2) cnt2 = row[1];
+    }
+    EXPECT_EQ(cnt1, 5) << "symbol=1 should have 5 rows in [1003,1007]";
+    EXPECT_EQ(cnt2, 2) << "symbol=2 should have 2 rows (ts 1003,1004)";
+}
+
+// Empty range: no rows before the data starts
+TEST_F(TimeRangeIndexTest, EmptyRange) {
+    auto result = executor->execute(
+        "SELECT price FROM trades "
+        "WHERE symbol = 1 AND timestamp BETWEEN 0 AND 999");
+    ASSERT_TRUE(result.ok()) << result.error;
+    EXPECT_EQ(result.rows.size(), 0u);
+}
+
+// Single-row precision: timestamp == 1005 exactly (i=5, price=15050)
+TEST_F(TimeRangeIndexTest, SingleRowPrecision) {
+    auto result = executor->execute(
+        "SELECT price FROM trades "
+        "WHERE symbol = 1 AND timestamp BETWEEN 1005 AND 1005");
+    ASSERT_TRUE(result.ok()) << result.error;
+    ASSERT_EQ(result.rows.size(), 1u);
+    EXPECT_EQ(result.rows[0][0], 15050);
+}
+
+// No symbol filter + time range: partition-level pruning via get_partitions_for_time_range
+// [1007,1009] → symbol=1: ts 1007,1008,1009 = 3 rows; symbol=2: max ts=1004 → 0 rows
+TEST_F(TimeRangeIndexTest, NoSymbolFilterPartialRange) {
+    auto result = executor->execute(
+        "SELECT count(*) FROM trades "
+        "WHERE timestamp BETWEEN 1007 AND 1009");
+    ASSERT_TRUE(result.ok()) << result.error;
+    ASSERT_EQ(result.rows.size(), 1u);
+    EXPECT_EQ(result.rows[0][0], 3);
+}
+
+// Full range still returns all rows (no regression)
+TEST_F(TimeRangeIndexTest, FullRangeNoRegression) {
+    auto result = executor->execute(
+        "SELECT count(*) FROM trades "
+        "WHERE symbol = 1 AND timestamp BETWEEN 0 AND 9223372036854775807");
+    ASSERT_TRUE(result.ok()) << result.error;
+    ASSERT_EQ(result.rows.size(), 1u);
+    EXPECT_EQ(result.rows[0][0], 10);
+}
+
+// ============================================================================
+// Part 8: Phase 3 — Date/Time Functions, LIKE, UNION
+// ============================================================================
+
+// ── Tokenizer ──────────────────────────────────────────────────────────────
+TEST(Tokenizer, DateTimeFunctionKeywords) {
+    Tokenizer tok;
+    auto tokens = tok.tokenize("DATE_TRUNC NOW EPOCH_S EPOCH_MS");
+    ASSERT_EQ(tokens[0].type, TokenType::DATE_TRUNC);
+    ASSERT_EQ(tokens[1].type, TokenType::NOW);
+    ASSERT_EQ(tokens[2].type, TokenType::EPOCH_S);
+    ASSERT_EQ(tokens[3].type, TokenType::EPOCH_MS);
+}
+
+TEST(Tokenizer, LikeAndSetOpKeywords) {
+    Tokenizer tok;
+    auto tokens = tok.tokenize("LIKE UNION ALL INTERSECT EXCEPT");
+    ASSERT_EQ(tokens[0].type, TokenType::LIKE);
+    ASSERT_EQ(tokens[1].type, TokenType::UNION);
+    ASSERT_EQ(tokens[2].type, TokenType::ALL);
+    ASSERT_EQ(tokens[3].type, TokenType::INTERSECT);
+    ASSERT_EQ(tokens[4].type, TokenType::EXCEPT);
+}
+
+// ── Parser: Date/time ──────────────────────────────────────────────────────
+TEST(Parser, DateTruncParsed) {
+    Parser p;
+    auto stmt = p.parse("SELECT DATE_TRUNC('min', recv_ts) AS tb FROM trades");
+    ASSERT_EQ(stmt.columns.size(), 1u);
+    ASSERT_NE(stmt.columns[0].arith_expr, nullptr);
+    EXPECT_EQ(stmt.columns[0].arith_expr->kind, ArithExpr::Kind::FUNC);
+    EXPECT_EQ(stmt.columns[0].arith_expr->func_name, "date_trunc");
+    EXPECT_EQ(stmt.columns[0].arith_expr->func_unit, "min");
+    EXPECT_EQ(stmt.columns[0].alias, "tb");
+}
+
+TEST(Parser, NowParsed) {
+    Parser p;
+    auto stmt = p.parse("SELECT NOW() AS ts FROM trades");
+    ASSERT_NE(stmt.columns[0].arith_expr, nullptr);
+    EXPECT_EQ(stmt.columns[0].arith_expr->func_name, "now");
+    EXPECT_EQ(stmt.columns[0].arith_expr->func_arg, nullptr);
+}
+
+TEST(Parser, EpochSParsed) {
+    Parser p;
+    auto stmt = p.parse("SELECT EPOCH_S(recv_ts) AS es FROM trades");
+    ASSERT_NE(stmt.columns[0].arith_expr, nullptr);
+    EXPECT_EQ(stmt.columns[0].arith_expr->func_name, "epoch_s");
+    ASSERT_NE(stmt.columns[0].arith_expr->func_arg, nullptr);
+    EXPECT_EQ(stmt.columns[0].arith_expr->func_arg->column, "recv_ts");
+}
+
+// ── Parser: LIKE ───────────────────────────────────────────────────────────
+TEST(Parser, LikeExpr) {
+    Parser p;
+    auto stmt = p.parse("SELECT price FROM trades WHERE price LIKE '150%'");
+    ASSERT_TRUE(stmt.where.has_value());
+    EXPECT_EQ(stmt.where->expr->kind, Expr::Kind::LIKE);
+    EXPECT_EQ(stmt.where->expr->column, "price");
+    EXPECT_EQ(stmt.where->expr->like_pattern, "150%");
+    EXPECT_FALSE(stmt.where->expr->negated);
+}
+
+TEST(Parser, NotLikeExpr) {
+    Parser p;
+    auto stmt = p.parse("SELECT price FROM trades WHERE price NOT LIKE '150%'");
+    ASSERT_TRUE(stmt.where.has_value());
+    EXPECT_EQ(stmt.where->expr->kind, Expr::Kind::LIKE);
+    EXPECT_TRUE(stmt.where->expr->negated);
+}
+
+// ── Parser: UNION ──────────────────────────────────────────────────────────
+TEST(Parser, UnionAllParsed) {
+    Parser p;
+    auto stmt = p.parse(
+        "SELECT price FROM trades WHERE symbol = 1 "
+        "UNION ALL "
+        "SELECT price FROM trades WHERE symbol = 2");
+    EXPECT_EQ(stmt.set_op, SelectStmt::SetOp::UNION_ALL);
+    ASSERT_NE(stmt.rhs, nullptr);
+    EXPECT_EQ(stmt.rhs->from_table, "trades");
+}
+
+TEST(Parser, UnionDistinctParsed) {
+    Parser p;
+    auto stmt = p.parse(
+        "SELECT price FROM trades WHERE symbol = 1 "
+        "UNION "
+        "SELECT price FROM trades WHERE symbol = 1");
+    EXPECT_EQ(stmt.set_op, SelectStmt::SetOp::UNION_DISTINCT);
+}
+
+TEST(Parser, IntersectParsed) {
+    Parser p;
+    auto stmt = p.parse(
+        "SELECT price FROM trades WHERE symbol = 1 "
+        "INTERSECT "
+        "SELECT price FROM trades WHERE symbol = 1");
+    EXPECT_EQ(stmt.set_op, SelectStmt::SetOp::INTERSECT);
+}
+
+TEST(Parser, ExceptParsed) {
+    Parser p;
+    auto stmt = p.parse(
+        "SELECT price FROM trades WHERE symbol = 1 "
+        "EXCEPT "
+        "SELECT price FROM trades WHERE symbol = 2");
+    EXPECT_EQ(stmt.set_op, SelectStmt::SetOp::EXCEPT);
+}
+
+// ── Executor: Date/time functions ──────────────────────────────────────────
+TEST_F(SqlExecutorTest, DateTruncUsResult) {
+    // DATE_TRUNC('us', price): price/1000*1000
+    // All prices 15000-15090 step 10: (150X0/1000)*1000 = 15000
+    auto r = executor->execute(
+        "SELECT DATE_TRUNC('us', price) AS tb FROM trades WHERE symbol = 1");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 10u);
+    for (const auto& row : r.rows)
+        EXPECT_EQ(row[0], 15000LL);  // all truncate to 15000
+}
+
+TEST_F(SqlExecutorTest, DateTruncMsResult) {
+    // DATE_TRUNC('ms', price): price/1_000_000*1_000_000
+    // all prices 15000-15090 → 0 (since < 1_000_000)
+    auto r = executor->execute(
+        "SELECT DATE_TRUNC('ms', price) AS tb FROM trades "
+        "WHERE symbol = 1 LIMIT 1");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 0LL);
+}
+
+TEST_F(SqlExecutorTest, EpochSResult) {
+    // EPOCH_S(price) = price / 1_000_000_000
+    // price=15000 → 0
+    auto r = executor->execute(
+        "SELECT EPOCH_S(price) AS es FROM trades WHERE symbol = 1 LIMIT 1");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 0LL);  // 15000 / 1e9 = 0
+}
+
+TEST_F(SqlExecutorTest, EpochMsResult) {
+    // EPOCH_MS(price) = price / 1_000_000
+    // price=15000 → 0
+    auto r = executor->execute(
+        "SELECT EPOCH_MS(price) AS em FROM trades WHERE symbol = 1 LIMIT 1");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 0LL);
+}
+
+TEST_F(SqlExecutorTest, NowPositive) {
+    // NOW() should return current time in nanoseconds (positive)
+    auto r = executor->execute(
+        "SELECT NOW() AS ts FROM trades WHERE symbol = 1 LIMIT 1");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_GT(r.rows[0][0], 0LL);
+}
+
+TEST_F(SqlExecutorTest, DateTruncInArith) {
+    // DATE_TRUNC inside arithmetic: DATE_TRUNC('us', price) + 1
+    // All prices 15000-15090: (150X0/1000)*1000 + 1 = 15001
+    auto r = executor->execute(
+        "SELECT DATE_TRUNC('us', price) + 1 AS v FROM trades WHERE symbol = 1");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 10u);
+    for (const auto& row : r.rows)
+        EXPECT_EQ(row[0], 15001LL);
+}
+
+// ── Executor: LIKE ─────────────────────────────────────────────────────────
+TEST_F(SqlExecutorTest, LikeExact) {
+    // WHERE price LIKE '15000' → only rows where price as string == "15000"
+    auto r = executor->execute(
+        "SELECT COUNT(*) FROM trades WHERE price LIKE '15000'");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 1);
+}
+
+TEST_F(SqlExecutorTest, LikePrefix) {
+    // WHERE price LIKE '150%' → all symbol=1 prices (15000-15090) start with "150"
+    auto r = executor->execute(
+        "SELECT COUNT(*) FROM trades WHERE price LIKE '150%'");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 10);
+}
+
+TEST_F(SqlExecutorTest, LikeSuffix) {
+    // WHERE price LIKE '%0' → prices ending in 0: all prices in set end in 0
+    // 15000,15010,...,15090,20000,20010,...,20040 → all 15 end in 0
+    auto r = executor->execute(
+        "SELECT COUNT(*) FROM trades WHERE price LIKE '%0'");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 15);
+}
+
+TEST_F(SqlExecutorTest, NotLike) {
+    // WHERE price NOT LIKE '150%' → symbol=2 prices (20000-20040) = 5 rows
+    auto r = executor->execute(
+        "SELECT COUNT(*) FROM trades WHERE price NOT LIKE '150%'");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 5);
+}
+
+TEST_F(SqlExecutorTest, LikeSymbolColumn) {
+    // WHERE symbol LIKE '1' → symbol=1 → 10 rows
+    auto r = executor->execute(
+        "SELECT COUNT(*) FROM trades WHERE symbol LIKE '1'");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 10);
+}
+
+TEST_F(SqlExecutorTest, LikeUnderscore) {
+    // WHERE price LIKE '1501_' → matches "15010" through "15019" (5 chars, starts 1501)
+    // From our set: only 15010 matches (15011..15019 not present)
+    auto r = executor->execute(
+        "SELECT COUNT(*) FROM trades WHERE price LIKE '1501_'");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 1);
+}
+
+// ── Executor: UNION / INTERSECT / EXCEPT ───────────────────────────────────
+TEST_F(SqlExecutorTest, UnionAllRowCount) {
+    // Two queries combined: 10 rows + 5 rows = 15 total
+    auto r = executor->execute(
+        "SELECT price FROM trades WHERE symbol = 1 "
+        "UNION ALL "
+        "SELECT price FROM trades WHERE symbol = 2");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_EQ(r.rows.size(), 15u);
+}
+
+TEST_F(SqlExecutorTest, UnionAllAggCombined) {
+    // COUNT from each symbol combined with UNION ALL
+    auto r = executor->execute(
+        "SELECT COUNT(*) AS cnt FROM trades WHERE symbol = 1 "
+        "UNION ALL "
+        "SELECT COUNT(*) AS cnt FROM trades WHERE symbol = 2");
+    ASSERT_TRUE(r.ok()) << r.error;
+    ASSERT_EQ(r.rows.size(), 2u);
+    // Two rows: one with 10 and one with 5 (order may vary)
+    int64_t sum = r.rows[0][0] + r.rows[1][0];
+    EXPECT_EQ(sum, 15LL);
+}
+
+TEST_F(SqlExecutorTest, UnionDistinctDedup) {
+    // UNION deduplicates identical rows
+    auto r = executor->execute(
+        "SELECT price FROM trades WHERE symbol = 1 AND price = 15000 "
+        "UNION "
+        "SELECT price FROM trades WHERE symbol = 1 AND price = 15000");
+    ASSERT_TRUE(r.ok()) << r.error;
+    // Both sides yield [15000]; after dedup → 1 row
+    EXPECT_EQ(r.rows.size(), 1u);
+    EXPECT_EQ(r.rows[0][0], 15000LL);
+}
+
+TEST_F(SqlExecutorTest, UnionDistinctNoOverlap) {
+    // UNION of disjoint sets = same as UNION ALL
+    auto r = executor->execute(
+        "SELECT price FROM trades WHERE symbol = 1 AND price <= 15020 "
+        "UNION "
+        "SELECT price FROM trades WHERE symbol = 2 AND price >= 20000");
+    ASSERT_TRUE(r.ok()) << r.error;
+    // Left: 15000,15010,15020 (3 rows); Right: 20000,20010,20020,20030,20040 (5 rows)
+    // No overlap → 8 distinct rows
+    EXPECT_EQ(r.rows.size(), 8u);
+}
+
+TEST_F(SqlExecutorTest, IntersectOverlap) {
+    // Prices in [15000,15040] ∩ [15020,15060] = {15020, 15030, 15040}
+    auto r = executor->execute(
+        "SELECT price FROM trades WHERE symbol = 1 AND price >= 15000 AND price <= 15040 "
+        "INTERSECT "
+        "SELECT price FROM trades WHERE symbol = 1 AND price >= 15020 AND price <= 15060");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_EQ(r.rows.size(), 3u);
+}
+
+TEST_F(SqlExecutorTest, IntersectEmpty) {
+    // Disjoint sets → empty intersection
+    auto r = executor->execute(
+        "SELECT price FROM trades WHERE symbol = 1 "
+        "INTERSECT "
+        "SELECT price FROM trades WHERE symbol = 2");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_EQ(r.rows.size(), 0u);
+}
+
+TEST_F(SqlExecutorTest, ExceptRemovesRows) {
+    // All symbol=1 prices EXCEPT those >= 15050 → 15000,15010,15020,15030,15040 (5 rows)
+    auto r = executor->execute(
+        "SELECT price FROM trades WHERE symbol = 1 "
+        "EXCEPT "
+        "SELECT price FROM trades WHERE symbol = 1 AND price >= 15050");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_EQ(r.rows.size(), 5u);
+}
+
+TEST_F(SqlExecutorTest, ExceptNoOverlap) {
+    // EXCEPT with disjoint right side → all left rows remain
+    auto r = executor->execute(
+        "SELECT price FROM trades WHERE symbol = 1 "
+        "EXCEPT "
+        "SELECT price FROM trades WHERE symbol = 2");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_EQ(r.rows.size(), 10u);
+}

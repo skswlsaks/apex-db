@@ -738,18 +738,18 @@ TEST(Benchmark, WindowJoin_100K_x_100K) {
     WindowJoinOperator wj(WJAggType::AVG, 5'000'000LL, 5'000'000LL);  // ±5ms
 
     auto t0 = std::chrono::high_resolution_clock::now();
-    // 전체 left 배치 처리 (실제로는 per-row지만 성능 측정)
+    // Execute as a single batch — how the SQL executor actually calls it.
+    // Calling execute() per-row would rebuild right_groups 100K times → O(N²).
+    // Batch execution builds right_groups once → O(N + N log N).
+    auto res = wj.execute(lk.data(), N, rk.data(), N,
+                          lt.data(), rt.data(), rv.data());
     size_t total_matches = 0;
-    for (size_t li = 0; li < N; ++li) {
-        auto res = wj.execute(lk.data() + li, 1, rk.data(), N,
-                              lt.data() + li, rt.data(), rv.data());
-        total_matches += res.match_counts[0];
-    }
+    for (size_t i = 0; i < N; ++i) total_matches += res.match_counts[i];
     auto t1 = std::chrono::high_resolution_clock::now();
 
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    // 성능 목표: 10초 이내 (O(n log m))
-    EXPECT_LT(ms, 10'000.0) << "Window JOIN 100K×100K took " << ms << "ms";
+    // Target: < 500ms for 100K×100K batch (O(N log N))
+    EXPECT_LT(ms, 500.0) << "Window JOIN 100K×100K batch took " << ms << "ms";
 
     printf("\n[BENCH] Window JOIN 100K×100K: %.2fms, total_matches=%zu\n",
            ms, total_matches);
