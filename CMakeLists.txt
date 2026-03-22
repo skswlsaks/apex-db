@@ -230,6 +230,24 @@ target_link_libraries(apex_core PUBLIC
     apex_execution
 )
 
+# --- Phase C: Cluster (분산 메모리 & 트랜스포트) ---
+add_library(apex_cluster STATIC
+    src/cluster/shm_backend.cpp
+    src/cluster/ucx_backend.cpp
+)
+target_include_directories(apex_cluster PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src/cluster   # shm_backend.h, ucx_backend.h (internal)
+)
+target_link_libraries(apex_cluster PUBLIC
+    apex_core
+)
+# UCX 발견 시 APEX_HAS_UCX 정의 + 링크
+if(APEX_USE_UCX AND UCX_FOUND)
+    target_compile_definitions(apex_cluster PUBLIC APEX_HAS_UCX=1)
+    target_link_libraries(apex_cluster PUBLIC PkgConfig::UCX)
+endif()
+
 # ============================================================================
 # Tests
 # ============================================================================
@@ -277,6 +295,24 @@ if(APEX_BUILD_BENCH)
         apex_execution
     )
     target_compile_options(bench_hdb PRIVATE
+        -O3 -march=native
+    )
+
+    # Phase C: Cluster 벤치마크
+    add_executable(bench_cluster
+        tests/bench/bench_cluster.cpp
+    )
+    target_include_directories(bench_cluster PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/cluster   # shm_backend.h 접근
+    )
+    target_link_libraries(bench_cluster PRIVATE
+        apex_cluster
+        apex_core
+        apex_storage
+        apex_ingestion
+        apex_execution
+    )
+    target_compile_options(bench_cluster PRIVATE
         -O3 -march=native
     )
 endif()
