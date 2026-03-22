@@ -1,62 +1,103 @@
-# [High-Level DB Software Architecture Design]
+# High-Level DB Software Architecture Design
+# ⚠️ 최종 업데이트: 2026-03-22 (Phase C + SQL + JOIN + Window 반영)
 
-This document outlines the macro-level software architecture of our Ultra-Low Latency In-Memory DB, heavily inspired by **KDB+ (Tick Plant & Array Locality)** and **ClickHouse (Vectorized Execution & MergeTree)**, optimized for modern CXL/RDMA hardware.
+## Overview
 
-## User Review Required
+APEX-DB는 **실시간 + 분석을 통합**하는 초저지연 인메모리 데이터베이스.
+HFT 특화로 시작했지만 범용 OLAP, TSDb, ML Feature Store로 확장됨.
 
-Please review this overarching structure. Once approved, we will perform a deep dive into each component step-by-step as outlined in our task list.
+## 시스템 레이어 구조 (현재 실제 구현)
 
-## 🏗 System Architecture Components
+```
+┌──────────────────────────────────────────────────────────┐
+│  Layer 5: Client Interface (현재 구현)                    │
+│  ┌─────────────┐  ┌──────────────┐  ┌─────────────────┐ │
+│  │ HTTP API     │  │ Python DSL   │  │ C++ Direct API  │ │
+│  │ (port 8123)  │  │ (pybind11)   │  │ (zero-copy)     │ │
+│  │ ClickHouse   │  │ Lazy Eval    │  │ ApexPipeline    │ │
+│  │ compatible  │  │ collect()    │  │                 │ │
+│  └─────────────┘  └──────────────┘  └─────────────────┘ │
+├──────────────────────────────────────────────────────────┤
+│  Layer 4: SQL + Query Planning                            │
+│  ┌──────────────────┐  ┌────────────────────────────┐    │
+│  │ SQL Parser        │  │ Query Executor              │    │
+│  │ Recursive descent │  │ AST → SIMD Engine           │    │
+│  │ 1.5~4.5μs parse  │  │ JOIN dispatch               │    │
+│  └──────────────────┘  └────────────────────────────┘    │
+├──────────────────────────────────────────────────────────┤
+│  Layer 3: Execution Engine                                │
+│  ┌───────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│  │ Vectorized    │  │ LLVM JIT     │  │ JOIN Ops      │  │
+│  │ Engine        │  │ O3 compiler  │  │ AsofJoin O(n) │  │
+│  │ Highway SIMD  │  │ 1.3ms/1M     │  │ HashJoin      │  │
+│  │ BitMask filter│  │              │  │ Window Funcs  │  │
+│  │ 272μs/1M      │  │              │  │ (prefix sum)  │  │
+│  └───────────────┘  └──────────────┘  └──────────────┘  │
+├──────────────────────────────────────────────────────────┤
+│  Layer 2: Ingestion (Tick Plant)                          │
+│  ┌───────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│  │ MPMC RingBuf  │  │ UCX/RDMA     │  │ WAL Writer   │  │
+│  │ 65K slots     │  │ Kernel bypass│  │ crash safe   │  │
+│  │ Lock-free     │  │ zero-copy    │  │              │  │
+│  └───────────────┘  └──────────────┘  └──────────────┘  │
+├──────────────────────────────────────────────────────────┤
+│  Layer 1: Storage Engine (DMMT)                           │
+│  ┌───────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│  │ Arena         │  │ Column Store │  │ HDB Writer   │  │
+│  │ Allocator     │  │ Arrow compat │  │ LZ4 압축     │  │
+│  │ Bump pointer  │  │ Append-only  │  │ 4.8GB/s      │  │
+│  │ Lock-free     │  │ BitMask      │  │ mmap read    │  │
+│  └───────────────┘  └──────────────┘  └──────────────┘  │
+├──────────────────────────────────────────────────────────┤
+│  Layer 0: Distributed Cluster (Phase C)                   │
+│  ┌───────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│  │ Transport     │  │ Partition    │  │ Health       │  │
+│  │ UCX (now)     │  │ Router       │  │ Monitor      │  │
+│  │ CXL (future)  │  │ ConsistHash  │  │ Heartbeat    │  │
+│  │ SharedMem(test│  │ 2ns lookup   │  │ Failover     │  │
+│  └───────────────┘  └──────────────┘  └──────────────┘  │
+└──────────────────────────────────────────────────────────┘
+```
 
-The architecture is divided into 4 primary layers.
+## 핵심 성능 수치 (현재 실측)
 
----
+| 메트릭 | 수치 | 비고 |
+|---|---|---|
+| 인제스션 | 5.52M ticks/sec | MPMC Ring Buffer |
+| filter 1M (BitMask) | 272μs | kdb+ 범위 진입 |
+| VWAP 1M | 532μs | Highway SIMD |
+| Window SUM 1M | 1.36ms | prefix sum O(n) |
+| Hash Join 1M | 42ms | unordered_map |
+| ASOF Join 1M | 53ms | binary search |
+| HDB flush | 4.8 GB/s | NVMe sequential |
+| SQL 파싱 | 1.5~4.5μs | recursive descent |
+| Transport (SHM) | 13.5ns | CXL sim baseline |
+| Partition routing | 2.0ns | consistent hash |
+| Python zero-copy | 522ns | pybind11 numpy |
 
-### [1. Ingestion Layer: RDMA Tick Plant]
-Inspired by KDB+'s Tickerplant, but redesigned for Kernel Bypass and Zero-Copy.
+## 타겟 시장 (확장)
 
-#### Responsibilities
-- Receives high-speed market data (FIX, Binary Pcap).
-- Acts as a Publisher/Subscriber router.
-- Writes to the write-ahead log (WAL) and memory simultaneously.
+| 분야 | 사용 사례 | 핵심 기능 |
+|---|---|---|
+| HFT | 틱 처리, 실시간 쿼리 | μs 레이턴시, ASOF JOIN |
+| 퀀트 리서치 | 백테스트, 팩터 분석 | Window 함수, Python DSL |
+| 리스크 관리 | 포지션×시나리오 | Hash JOIN, GROUP BY |
+| FDS | 이상거래 탐지 | 실시간 스트리밍 + 패턴 |
+| OLAP | ClickHouse 대체 | SQL, HTTP API, 범용 쿼리 |
+| IoT/모니터링 | 시계열 분석 | TSDb 모드, 압축 |
+| ML | Feature 서빙 | zero-copy Python |
 
-#### Key Mechanics
-- **Lock-Free MPMC Ring Buffer:** Built with C++20 atomics.
-- **Zero-Copy RDMA:** NIC writes directly into the CXL Memory Pool. No OS network stack overhead.
+## 구현 기술 스택 (확정)
 
-### [2. Storage Layer: Disaggregated Memory MergeTree (DMMT)]
-Combines KDB+'s RDB/HDB concept with ClickHouse's background merge capabilities.
-
-#### RDB (Real-time DB) - Hot Data
-- Purely in-memory, residing in the **Global Shared Memory Pool** (CXL/EFA).
-- Data is stored in Apache Arrow-compatible **Column Vectors**.
-- Optimized for instant append and extreme cache locality.
-
-#### HDB (Historical DB) - Warm/Cold Data
-- Similar to ClickHouse `MergeTree`.
-- Background threads asynchronously flush compacted data chunks from the RDB to NVMe SSDs or Cloud Object Storage (S3).
-- Ensures the RDB never runs out of capacity without pausing ingestion.
-
-### [3. Query & Execution Engine]
-Replaces KDB+'s `q` interpreter with ClickHouse's Vectorized Engine approach, augmented by JIT.
-
-#### Vectorized Execution Pipeline
-- Processes data in `DataBlocks` (e.g., arrays of 8192 rows across multiple columns).
-- Fully leverages SIMD (AVX-512, ARM SVE) to execute filters and aggregations.
-- Keeps L1/L2 caches hot, eliminating pointer chasing.
-
-#### LLVM JIT Compiler
-- For complex predicates (`WHERE price > 100 AND volume * vwap > 1000`), the engine dynamically compiles an optimized machine-code function at runtime instead of interpreting the query tree.
-
-### [4. Client / Transpilation Layer]
-The "Research to Production" bridge.
-
-#### AST Transpiler
-- Translates Python (Pandas/Polars) logic into a C++ Execution DAG.
-- Passes the DAG directly into the Query Engine.
-- Uses `pybind11` for **Zero-Copy Data Retrieval** from the RDB memory pool directly to the Python runtime.
-
-## Verification Plan
-We will step sequentially through the 4 deep dives listed in `task.md`.
-For each deep dive, we will design the C++ class structures, memory layouts, and API boundaries. 
-User feedback will dictate the direction of each deep dive.
+| 레이어 | 기술 | 비고 |
+|---|---|---|
+| 언어 | C++20 | Clang 19 |
+| SIMD | Google Highway 1.2 | AVX-512/ARM SVE 자동 |
+| JIT | LLVM 19 OrcJIT | 동적 쿼리 컴파일 |
+| 통신 | UCX (→ CXL) | Transport 교체 가능 |
+| 압축 | LZ4 | 0.31 압축비 |
+| 포맷 | Apache Arrow 호환 | zero-copy |
+| Python | pybind11 (nanobind 대신) | 안정성 우선 |
+| HTTP | cpp-httplib | ClickHouse port 8123 |
+| 빌드 | CMake + Ninja | |
+| 테스트 | Google Test | |

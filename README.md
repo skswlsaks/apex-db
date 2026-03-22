@@ -2,14 +2,14 @@
 
 # 🏛️ APEX-DB
 
-### Ultra-Low Latency In-Memory Database for HFT
+### Ultra-Low Latency In-Memory Database
 
-*금융 고빈도 매매(HFT) 특화 차세대 인메모리 데이터베이스*
+*실시간 + 분석을 통합하는 초저지연 인메모리 데이터베이스*
 
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-blue)
-![LLVM](https://img.shields.io/badge/LLVM-19-orange)
-![License](https://img.shields.io/badge/license-proprietary-red)
-![Status](https://img.shields.io/badge/status-MVP-green)
+![LLVM 19](https://img.shields.io/badge/LLVM-19-orange)
+![Highway SIMD](https://img.shields.io/badge/SIMD-Highway-green)
+![Tests](https://img.shields.io/badge/tests-53%2B%20passing-brightgreen)
 
 </div>
 
@@ -17,170 +17,192 @@
 
 ## Overview
 
-APEX-DB는 기존 kdb+의 한계를 돌파하기 위해 설계된 **클라우드 네이티브 초저지연 인메모리 데이터베이스**입니다.
+APEX-DB는 HFT 특화로 설계된 초저지연 인메모리 데이터베이스로,
+**kdb+의 성능**과 **ClickHouse의 범용성**, **Polars의 Python 생태계**를 통합합니다.
 
-**핵심 차별점:**
-- 🚀 **5.52M ticks/sec** 인제스션 처리량 (kdb+ tickerplant 동등~우위)
-- ⚡ **914M rows/sec** VWAP 쿼리 처리 (scalar 기준, SIMD 적용 시 10x+ 예상)
-- 🧠 **LLVM JIT 컴파일러** — 동적 쿼리를 런타임에 기계어로 변환
-- 🔗 **Research → Production 무번역** — Python 코드가 C++ 성능으로 직접 실행
-- 📊 **Zero-Copy** — NIC → 스토리지 → Python까지 데이터 복사 없음
+### 핵심 성능 (실측)
+
+| 메트릭 | 수치 |
+|---|---|
+| 인제스션 | **5.52M ticks/sec** |
+| filter 1M rows | **272μs** (kdb+ 범위 진입) |
+| VWAP 1M rows | **532μs** |
+| Window SUM 1M | **1.36ms** (O(n) prefix sum) |
+| SQL 파싱 | **1.5~4.5μs** |
+| Python zero-copy | **522ns** (numpy view) |
+| HDB flush | **4.8 GB/s** |
+| Partition routing | **2ns** |
+
+### vs kdb+ / ClickHouse
+
+| | kdb+ | ClickHouse | **APEX-DB** |
+|---|---|---|---|
+| 인제스션 | ~5M/sec | 배치 최적화 | **5.52M/sec** |
+| filter 1M | ~100-300μs | ms 단위 | **272μs** ✅ |
+| VWAP 1M | ~200-500μs | ms 단위 | **532μs** ✅ |
+| SQL | q 언어 | 표준 SQL | **표준 SQL** |
+| Python | PyKX (IPC) | clickhouse-connect | **zero-copy** |
+| 오픈소스 | ❌ 유료 | ✅ | ✅ |
+
+---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Layer 4: Transpiler                   │
-│           Python DSL → AST → C++ DAG (nanobind)         │
-├─────────────────────────────────────────────────────────┤
-│                 Layer 3: Execution Engine                │
-│        Vectorized Pipeline + LLVM JIT + Highway SIMD    │
-├─────────────────────────────────────────────────────────┤
-│                 Layer 2: Ingestion (Tick Plant)          │
-│       MPMC Ring Buffer + RDMA/UCX + WAL + Zero-Copy     │
-├─────────────────────────────────────────────────────────┤
-│              Layer 1: Storage Engine (DMMT)              │
-│    Arena Allocator + Columnar Store + Partition Manager  │
-│         CXL/RDMA Global Shared Memory Pool              │
-└─────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────┐
+│  Layer 5: Client Interface                         │
+│  HTTP API (port 8123) · Python DSL · C++ API      │
+├───────────────────────────────────────────────────┤
+│  Layer 4: SQL + Query Planning                     │
+│  Recursive descent parser · AST executor          │
+├───────────────────────────────────────────────────┤
+│  Layer 3: Execution Engine                         │
+│  Highway SIMD · LLVM JIT · ASOF/Hash JOIN         │
+│  Window Functions (ROW_NUMBER/SUM/AVG/LAG/LEAD)   │
+├───────────────────────────────────────────────────┤
+│  Layer 2: Ingestion (Tick Plant)                   │
+│  MPMC Ring Buffer · UCX/RDMA · WAL               │
+├───────────────────────────────────────────────────┤
+│  Layer 1: Storage Engine (DMMT)                    │
+│  Arena Allocator · Column Store · HDB (LZ4)       │
+├───────────────────────────────────────────────────┤
+│  Layer 0: Distributed Cluster                      │
+│  Transport (UCX→CXL) · Consistent Hash · Health  │
+└───────────────────────────────────────────────────┘
 ```
 
-## Tech Stack
+---
 
-| 구분 | 기술 |
-|---|---|
-| 언어 | C++20, Rust (패킷 파싱) |
-| 컴파일러 | Clang 19 |
-| SIMD | Google Highway (AVX-512 / ARM SVE 자동 디스패치) |
-| JIT | LLVM 19 OrcJIT |
-| 통신 | UCX (RDMA/InfiniBand/AWS EFA 통합) |
-| 메모리 | HugePages, NUMA-aware, CXL 3.0 |
-| 데이터 포맷 | Apache Arrow C Data Interface 호환 |
-| 직렬화 | FlatBuffers |
-| Python 바인딩 | nanobind (Zero-copy) |
-| 빌드 | CMake + Ninja |
-| 테스트 | Google Test |
+## Quick Start
+
+### SQL via HTTP (ClickHouse compatible)
+
+```bash
+# 서버 시작
+./apex_server --port 8123
+
+# 쿼리 (curl)
+curl -X POST http://localhost:8123/ \
+  -d 'SELECT vwap(price, volume), count(*) FROM trades WHERE symbol = 1'
+
+# Grafana: ClickHouse 데이터소스로 바로 연결
+```
+
+### Python DSL (zero-copy)
+
+```python
+import apex
+from apex_py.dsl import DataFrame
+
+db = apex.Pipeline()
+db.start()
+
+# 틱 인제스트
+db.ingest(symbol=1, price=15000, volume=100)
+db.drain()
+
+# zero-copy numpy (복사 없음)
+prices = db.get_column(symbol=1, name="price")  # 522ns
+
+# Lazy DSL (Polars 스타일)
+df = DataFrame(db, symbol=1)
+ma20 = df['price'].rolling(20).mean().collect()  # C++ 실행
+```
+
+### SQL 예시
+
+```sql
+-- 기본 집계
+SELECT symbol, vwap(price, volume), sum(volume)
+FROM trades
+WHERE timestamp BETWEEN 1000000 AND 2000000
+GROUP BY symbol
+
+-- ASOF JOIN (시계열 핵심)
+SELECT t.price, q.bid, q.ask
+FROM trades t
+ASOF JOIN quotes q
+ON t.symbol = q.symbol AND t.timestamp >= q.timestamp
+
+-- Window 함수
+SELECT symbol, price,
+       AVG(price) OVER (PARTITION BY symbol ROWS 20 PRECEDING) AS ma20,
+       LAG(price, 1) OVER (PARTITION BY symbol) AS prev_price,
+       RANK() OVER (ORDER BY price DESC) AS rank
+FROM trades
+```
+
+---
+
+## Build
+
+```bash
+# Dependencies (Amazon Linux 2023 / Fedora)
+sudo dnf install -y clang19 clang19-devel llvm19-devel \
+  highway-devel numactl-devel ucx-devel ninja-build lz4-devel
+
+mkdir -p build && cd build
+cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19
+ninja -j$(nproc)
+
+# Tests
+./tests/apex_tests
+python3 -m pytest ../tests/test_python.py -v
+```
+
+---
 
 ## Project Structure
 
 ```
 apex-db/
-├── CMakeLists.txt
-├── README.md
-├── include/apex/           # Public headers
-│   ├── common/             #   Types, Logger
-│   ├── core/               #   Pipeline (E2E)
-│   ├── storage/            #   Arena, ColumnStore, PartitionManager
-│   ├── ingestion/          #   RingBuffer, TickPlant, WAL
-│   ├── execution/          #   VectorizedEngine, QueryPlanner, JIT
-│   └── transpiler/         #   Python DSL bridge (planned)
-├── src/                    # Implementation
-│   ├── common/
-│   ├── core/
-│   ├── storage/
-│   ├── ingestion/
-│   └── execution/
+├── include/apex/
+│   ├── storage/        # Arena, ColumnStore, PartitionManager, HDB
+│   ├── ingestion/      # RingBuffer, TickPlant, WAL
+│   ├── execution/      # VectorizedEngine, JIT, JOIN, WindowFunctions
+│   ├── sql/            # Tokenizer, Parser, AST, Executor
+│   ├── server/         # HttpServer (ClickHouse compatible)
+│   ├── core/           # ApexPipeline (E2E integration)
+│   ├── cluster/        # Transport, PartitionRouter, HealthMonitor
+│   └── transpiler/     # Python binding (pybind11)
+├── src/                # Implementation
 ├── tests/
-│   ├── unit/               # Google Test unit tests
-│   └── bench/              # Benchmarks
-├── docs/
-│   ├── design/             # 아키텍처 & 레이어별 설계 문서
-│   ├── requirements/       # 시스템 요구사항 (PRD/SRS)
-│   ├── bench/              # 벤치마크 결과
-│   └── devlog/             # 개발 일지
-└── scripts/                # Utility scripts
+│   ├── unit/           # Google Test (53+ tests)
+│   └── bench/          # Benchmarks
+└── docs/
+    ├── design/         # Architecture + Layer design docs
+    ├── requirements/   # PRD/SRS
+    ├── bench/          # Benchmark results
+    └── devlog/         # Development log (000~008)
 ```
 
-## Quick Start
+---
 
-### Prerequisites
+## Target Markets
 
-```bash
-# Amazon Linux 2023 / Fedora
-sudo dnf install -y \
-  clang19 clang19-devel \
-  llvm19-devel llvm19-libs \
-  highway-devel \
-  numactl-devel \
-  ucx-devel \
-  boost-devel \
-  ninja-build
-```
-
-### Build
-
-```bash
-cd apex-db
-mkdir -p build && cd build
-
-cmake .. \
-  -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=clang-19 \
-  -DCMAKE_CXX_COMPILER=clang++-19
-
-ninja -j$(nproc)
-```
-
-### Test
-
-```bash
-./tests/apex_tests          # 19 unit tests
-./bench_pipeline            # E2E benchmark
-```
-
-## Benchmark Results (Phase E — MVP)
-
-*환경: Intel Xeon 6975P-C, 8 vCPU, 30GB RAM, Amazon Linux 2023*
-
-### Ingestion
-| 배치 | 처리량 |
+| 분야 | 사용 사례 |
 |---|---|
-| Single | 4.97M ticks/sec |
-| Batch 512 | **5.52M ticks/sec** |
+| HFT/금융 | 틱 처리, ASOF JOIN, 리스크 계산 |
+| 퀀트 리서치 | 백테스트, Window 함수, Python DSL |
+| OLAP | ClickHouse 대체, Grafana 연동 |
+| IoT/모니터링 | 시계열 분석, LZ4 압축 |
+| ML | Feature Store, zero-copy numpy |
 
-### Query Latency
-| 쿼리 | 100K rows | 1M rows | 5M rows |
-|---|---|---|---|
-| VWAP (p50) | 52μs | 637μs | 3.5ms |
-| Filter+Sum (p50) | 75μs | 789μs | 3.9ms |
-| Count (p50) | 0.1μs | 0.1μs | 0.1μs |
-
-### vs kdb+ (참고치)
-| 메트릭 | kdb+ | APEX-DB | 상태 |
-|---|---|---|---|
-| 인제스션 | ~2-5M/sec | 5.52M/sec | ✅ |
-| VWAP 1M | ~500-800μs | 637μs | ✅ |
-
-> SIMD + JIT 적용 후 쿼리 10-30x 개선 예상
+---
 
 ## Development Phases
 
-- [x] **Phase E** — End-to-End Pipeline MVP
-- [ ] **Phase B** — Highway SIMD + LLVM JIT (in progress)
-- [ ] **Phase A** — HDB Flush & Tiered Storage
-- [ ] **Phase D** — Python Transpiler Bridge
-- [ ] **Phase C** — Distributed Memory (Multi-node)
-
-## Docs
-
-| 문서 | 설명 |
-|---|---|
-| [초기 전략서](docs/design/initial_doc.md) | 타겟 시장, 설계 원칙, 클라우드 전략 |
-| [고수준 아키텍처](docs/design/high_level_architecture.md) | 4레이어 시스템 구조 |
-| [코어 아키텍처](docs/design/architecture_design.md) | 엔진 상세 설계, R2P 브릿지 |
-| [시스템 요구사항](docs/requirements/system_requirements.md) | PRD & SRS |
-| [Layer 1: Storage](docs/design/layer1_storage_memory.md) | DMMT, Arena, 파티셔닝 |
-| [Layer 2: Ingestion](docs/design/layer2_ingestion_network.md) | Tick Plant, MPMC, RDMA |
-| [Layer 3: Execution](docs/design/layer3_execution_engine.md) | 벡터화, JIT, SIMD |
-| [Layer 4: Transpiler](docs/design/layer4_transpiler_client.md) | Python DSL, Zero-copy |
-
-## Target Market
-
-- 🏦 고빈도 매매(HFT) 헤지펀드
-- 🏛️ 투자은행(IB) 리스크 시스템
-- 🪙 가상자산 거래소 인프라
-- 🔍 실시간 이상거래 탐지(FDS)
+- [x] **Phase E** — E2E Pipeline MVP (5.52M ticks/sec)
+- [x] **Phase B** — SIMD + JIT (BitMask 11x, filter kdb+ 범위)
+- [x] **Phase A** — HDB Tiered Storage (LZ4, 4.8GB/s flush)
+- [x] **Phase D** — Python Bridge (zero-copy, 4x vs Polars)
+- [x] **Phase C** — Distributed Cluster (CXL 시뮬, 2ns routing)
+- [x] **SQL + HTTP** — Parser + ClickHouse API
+- [x] **JOIN + Window** — ASOF, Hash, ROW_NUMBER~LEAD
+- [ ] GROUP BY 최적화
+- [ ] ARM Graviton 검증
+- [ ] AWS Fleet API 통합
 
 ## License
 
