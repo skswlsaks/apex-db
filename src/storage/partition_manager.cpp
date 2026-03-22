@@ -107,4 +107,14 @@ std::vector<Partition*> PartitionManager::seal_old_partitions(
     return sealed;
 }
 
+std::vector<Partition*> PartitionManager::get_sealed_partitions() {
+    std::vector<Partition*> result;
+    for (auto& [key, partition] : partitions_) {
+        if (partition->state() == Partition::State::SEALED) {
+            result.push_back(partition.get());
+        }
+    }
+    return result;
+}
+
 } // namespace apex::storage

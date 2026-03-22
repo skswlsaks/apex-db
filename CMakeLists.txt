@@ -32,6 +32,7 @@ option(APEX_USE_HUGEPAGES  "Enable HugePages support"   ON)
 option(APEX_USE_UCX        "Enable UCX (RDMA/CXL)"      ON)
 option(APEX_USE_JIT        "Enable LLVM JIT engine"      ON)
 option(APEX_USE_HIGHWAY    "Enable Highway SIMD"         ON)
+option(APEX_USE_LZ4        "Enable LZ4 compression"     ON)
 
 # ============================================================================
 # Compiler Flags
@@ -94,6 +95,18 @@ endif()
 # --- NUMA ---
 find_library(NUMA_LIB numa REQUIRED)
 
+# --- LZ4 (optional) ---
+if(APEX_USE_LZ4)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LZ4 IMPORTED_TARGET liblz4)
+    if(LZ4_FOUND)
+        message(STATUS "LZ4: ${LZ4_VERSION} (압축 활성화)")
+    else()
+        message(STATUS "LZ4: 없음 — 압축 비활성화 (패스스루 모드)")
+        set(APEX_USE_LZ4 OFF)
+    endif()
+endif()
+
 # --- Highway (SIMD) ---
 if(APEX_USE_HIGHWAY)
     find_package(PkgConfig REQUIRED)
@@ -141,6 +154,9 @@ add_library(apex_storage STATIC
     src/storage/arena_allocator.cpp
     src/storage/column_store.cpp
     src/storage/partition_manager.cpp
+    src/storage/hdb_writer.cpp
+    src/storage/hdb_reader.cpp
+    src/storage/flush_manager.cpp
 )
 target_include_directories(apex_storage PUBLIC
     ${CMAKE_SOURCE_DIR}/include
@@ -151,6 +167,10 @@ target_link_libraries(apex_storage PUBLIC
 )
 if(APEX_USE_HIGHWAY)
     target_link_libraries(apex_storage PUBLIC PkgConfig::HWY)
+endif()
+if(APEX_USE_LZ4)
+    target_link_libraries(apex_storage PUBLIC PkgConfig::LZ4)
+    target_compile_definitions(apex_storage PUBLIC APEX_HDB_FORCE_LZ4=1)
 endif()
 
 # --- Layer 2: Ingestion (Tick Plant) ---
@@ -244,6 +264,19 @@ if(APEX_BUILD_BENCH)
     target_compile_options(bench_simd_jit PRIVATE
         -O3 -march=native
     )
+
+    add_executable(bench_hdb
+        tests/bench/bench_hdb.cpp
+    )
+    target_link_libraries(bench_hdb PRIVATE
+        apex_core
+        apex_storage
+        apex_ingestion
+        apex_execution
+    )
+    target_compile_options(bench_hdb PRIVATE
+        -O3 -march=native
+    )
 endif()
 
 # ============================================================================
@@ -258,5 +291,6 @@ message(STATUS "  HugePages:     ${APEX_USE_HUGEPAGES}")
 message(STATUS "  UCX (RDMA):    ${APEX_USE_UCX}")
 message(STATUS "  Highway SIMD:  ${APEX_USE_HIGHWAY}")
 message(STATUS "  LLVM JIT:      ${APEX_USE_JIT}")
+message(STATUS "  LZ4:           ${APEX_USE_LZ4}")
 message(STATUS "  Tests:         ${APEX_BUILD_TESTS}")
 message(STATUS "=================================")

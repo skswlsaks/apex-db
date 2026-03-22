@@ -12,6 +12,10 @@
 //                                                                 |
 //                    query_vwap() / query_filter_sum() -----------+
 //                              -> VectorizedEngine (벡터화 연산)
+//
+//   Tiered 모드:
+//     FlushManager 백그라운드 스레드 → SEALED 파티션 → HDBWriter → 디스크
+//     쿼리 시: RDB (메모리) + HDB (디스크 mmap) 통합 집계
 // ============================================================================
 
 #include "apex/core/pipeline.h"
@@ -46,9 +50,30 @@ ApexPipeline::ApexPipeline(PipelineConfig config)
     : config_(config)
     , partition_mgr_(config.arena_size_per_partition)
 {
-    APEX_INFO("ApexPipeline 초기화 (arena={}MB, batch={})",
+    APEX_INFO("ApexPipeline 초기화 (arena={}MB, batch={}, mode={})",
               config.arena_size_per_partition / (1024*1024),
-              config.drain_batch_size);
+              config.drain_batch_size,
+              static_cast<int>(config.storage_mode));
+
+    // Tiered / Pure On-Disk 모드에서 HDB 컴포넌트 초기화
+    if (config_.storage_mode == StorageMode::TIERED ||
+        config_.storage_mode == StorageMode::PURE_ON_DISK) {
+
+        const bool use_comp = config_.flush_config.enable_compression;
+        hdb_writer_ = std::make_unique<HDBWriter>(config_.hdb_base_path, use_comp);
+        hdb_reader_ = std::make_unique<HDBReader>(config_.hdb_base_path);
+
+        if (config_.storage_mode == StorageMode::TIERED) {
+            flush_manager_ = std::make_unique<FlushManager>(
+                partition_mgr_,
+                *hdb_writer_,
+                config_.flush_config
+            );
+            APEX_INFO("FlushManager 생성됨 (Tiered 모드)");
+        }
+
+        APEX_INFO("HDB 활성화: path={}", config_.hdb_base_path);
+    }
 }
 
 ApexPipeline::~ApexPipeline() {
@@ -69,12 +94,23 @@ void ApexPipeline::start() {
         return;
     }
 
+    // FlushManager 시작 (Tiered 모드)
+    if (flush_manager_) {
+        flush_manager_->start();
+    }
+
     drain_thread_ = std::thread([this]() { drain_loop(); });
     APEX_INFO("ApexPipeline 시작 완료");
 }
 
 void ApexPipeline::stop() {
     running_.store(false, std::memory_order_release);
+
+    // FlushManager 먼저 중지
+    if (flush_manager_) {
+        flush_manager_->stop();
+    }
+
     if (drain_thread_.joinable()) {
         drain_thread_.join();
     }
@@ -209,6 +245,32 @@ ApexPipeline::ColumnSnapshot ApexPipeline::build_snapshot(
 }
 
 // ============================================================================
+// hdb_count_range: HDB에서 시간 범위 내 COUNT 집계
+// (Tiered 쿼리의 HDB 기여분 계산)
+// ============================================================================
+size_t ApexPipeline::hdb_count_range(SymbolId symbol,
+                                      Timestamp from, Timestamp to) const {
+    if (!hdb_reader_) return 0;
+
+    const auto partitions = hdb_reader_->list_partitions_in_range(symbol, from, to);
+    size_t total = 0;
+
+    for (const int64_t hour : partitions) {
+        auto ts_col = hdb_reader_->read_column(symbol, hour, COL_TIMESTAMP);
+        if (!ts_col.valid()) continue;
+
+        const auto ts_span = ts_col.as_span<int64_t>();
+        for (const int64_t ts : ts_span) {
+            if (ts >= from && ts <= to) {
+                ++total;
+            }
+        }
+    }
+
+    return total;
+}
+
+// ============================================================================
 // query_vwap: VWAP 쿼리
 // ============================================================================
 QueryResult ApexPipeline::query_vwap(
@@ -217,12 +279,6 @@ QueryResult ApexPipeline::query_vwap(
     const int64_t t0 = pipeline_now_ns();
 
     const auto partitions = find_partitions(symbol);
-    if (partitions.empty()) {
-        return QueryResult{
-            .type = QueryResult::Type::ERROR,
-            .error_msg = "no data for symbol"
-        };
-    }
 
     __int128 pv_sum    = 0;
     int64_t  v_sum     = 0;
@@ -230,26 +286,23 @@ QueryResult ApexPipeline::query_vwap(
 
     const bool full_scan = (from == 0 && to == INT64_MAX);
 
+    // ===== RDB (in-memory) 스캔 =====
     for (Partition* part : partitions) {
         const auto snap = build_snapshot(part, "");
         if (snap.count == 0) continue;
 
-        // 파티션 전체가 time range 밖이면 skip
         if (!full_scan) {
             if (snap.timestamps[snap.count - 1] < from) continue;
             if (snap.timestamps[0] > to) continue;
         }
 
         if (full_scan) {
-            // 최적화 경로: 전체 스캔
-            // 컴파일러가 자동 벡터화 (auto-vectorization)
             for (size_t i = 0; i < snap.count; ++i) {
                 pv_sum += static_cast<__int128>(snap.prices[i]) * snap.volumes[i];
                 v_sum  += snap.volumes[i];
             }
             total_rows += snap.count;
         } else {
-            // Time range 필터 경로
             for (size_t i = 0; i < snap.count; ++i) {
                 if (snap.timestamps[i] >= from && snap.timestamps[i] <= to) {
                     pv_sum += static_cast<__int128>(snap.prices[i]) * snap.volumes[i];
@@ -258,6 +311,38 @@ QueryResult ApexPipeline::query_vwap(
                 }
             }
         }
+    }
+
+    // ===== HDB (disk mmap) 스캔 — Tiered / Pure On-Disk 모드 =====
+    if (hdb_reader_ && partitions.empty()) {
+        // RDB에 없을 때만 HDB 조회 (또는 Pure On-Disk 모드)
+        const auto hdb_parts = hdb_reader_->list_partitions_in_range(symbol, from, to);
+        for (const int64_t hour : hdb_parts) {
+            auto ts_col  = hdb_reader_->read_column(symbol, hour, COL_TIMESTAMP);
+            auto px_col  = hdb_reader_->read_column(symbol, hour, COL_PRICE);
+            auto vol_col = hdb_reader_->read_column(symbol, hour, COL_VOLUME);
+
+            if (!ts_col.valid() || !px_col.valid() || !vol_col.valid()) continue;
+
+            const auto ts_span  = ts_col.as_span<int64_t>();
+            const auto px_span  = px_col.as_span<int64_t>();
+            const auto vol_span = vol_col.as_span<int64_t>();
+
+            for (size_t i = 0; i < ts_col.num_rows; ++i) {
+                if (full_scan || (ts_span[i] >= from && ts_span[i] <= to)) {
+                    pv_sum += static_cast<__int128>(px_span[i]) * vol_span[i];
+                    v_sum  += vol_span[i];
+                    ++total_rows;
+                }
+            }
+        }
+    }
+
+    if (total_rows == 0) {
+        return QueryResult{
+            .type = QueryResult::Type::ERROR,
+            .error_msg = "no data for symbol"
+        };
     }
 
     QueryResult r;
@@ -286,12 +371,6 @@ QueryResult ApexPipeline::query_filter_sum(
     const int64_t t0 = pipeline_now_ns();
 
     const auto partitions = find_partitions(symbol);
-    if (partitions.empty()) {
-        return QueryResult{
-            .type = QueryResult::Type::ERROR,
-            .error_msg = "no data for symbol"
-        };
-    }
 
     int64_t total_sum  = 0;
     size_t  total_rows = 0;
@@ -301,11 +380,11 @@ QueryResult ApexPipeline::query_filter_sum(
     // SelectionVector: DATABLOCK_ROWS 크기
     SelectionVector sel(DATABLOCK_ROWS);
 
+    // ===== RDB 스캔 =====
     for (Partition* part : partitions) {
         const auto snap = build_snapshot(part, column);
         if (snap.count == 0) continue;
 
-        // 쿼리 컬럼 결정 (price or volume or extra)
         const int64_t* col_data = nullptr;
         if (column == COL_PRICE) {
             col_data = snap.prices;
@@ -314,13 +393,12 @@ QueryResult ApexPipeline::query_filter_sum(
         } else if (snap.extra_col) {
             col_data = snap.extra_col;
         } else {
-            col_data = snap.prices; // fallback
+            col_data = snap.prices;
         }
 
         if (!col_data) continue;
 
         if (full_scan) {
-            // 벡터화 블록 처리 (8192 row chunks)
             size_t offset = 0;
             while (offset < snap.count) {
                 const size_t block = std::min(DATABLOCK_ROWS, snap.count - offset);
@@ -330,11 +408,32 @@ QueryResult ApexPipeline::query_filter_sum(
                 offset     += block;
             }
         } else {
-            // Time range 적용
             for (size_t i = 0; i < snap.count; ++i) {
                 if (snap.timestamps[i] >= from && snap.timestamps[i] <= to) {
                     if (col_data[i] > threshold) {
                         total_sum += col_data[i];
+                        ++total_rows;
+                    }
+                }
+            }
+        }
+    }
+
+    // ===== HDB 스캔 — Tiered / Pure On-Disk 모드 =====
+    if (hdb_reader_ && partitions.empty()) {
+        const auto hdb_parts = hdb_reader_->list_partitions_in_range(symbol, from, to);
+        for (const int64_t hour : hdb_parts) {
+            auto ts_col  = hdb_reader_->read_column(symbol, hour, COL_TIMESTAMP);
+            auto tgt_col = hdb_reader_->read_column(symbol, hour, column);
+            if (!ts_col.valid() || !tgt_col.valid()) continue;
+
+            const auto ts_span  = ts_col.as_span<int64_t>();
+            const auto col_span = tgt_col.as_span<int64_t>();
+
+            for (size_t i = 0; i < ts_col.num_rows; ++i) {
+                if (full_scan || (ts_span[i] >= from && ts_span[i] <= to)) {
+                    if (col_span[i] > threshold) {
+                        total_sum += col_span[i];
                         ++total_rows;
                     }
                 }
@@ -368,6 +467,7 @@ QueryResult ApexPipeline::query_count(
 
     const bool full_scan = (from == 0 && to == INT64_MAX);
 
+    // RDB 스캔
     for (Partition* part : partitions) {
         const auto snap = build_snapshot(part, "");
         if (snap.count == 0) continue;
@@ -381,6 +481,11 @@ QueryResult ApexPipeline::query_count(
                 }
             }
         }
+    }
+
+    // HDB 스캔 (Tiered / Pure On-Disk 모드)
+    if (hdb_reader_) {
+        total += hdb_count_range(symbol, from, to);
     }
 
     QueryResult r;
@@ -411,3 +516,4 @@ size_t ApexPipeline::total_stored_rows() const {
 }
 
 } // namespace apex::core
+

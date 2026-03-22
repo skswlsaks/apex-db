@@ -8,11 +8,15 @@
 //   - 단일 API로 ingest → store → query 엔드투엔드 지원
 //   - 백그라운드 드레인 스레드로 틱을 ColumnStore에 저장
 //   - 쿼리는 저장된 컬럼 데이터에 직접 벡터화 실행
+//   - StorageMode에 따라 HDB 계층도 함께 쿼리 (Tiered / Pure On-Disk)
 // ============================================================================
 
 #include "apex/common/types.h"
 #include "apex/ingestion/tick_plant.h"
 #include "apex/storage/partition_manager.h"
+#include "apex/storage/hdb_writer.h"
+#include "apex/storage/hdb_reader.h"
+#include "apex/storage/flush_manager.h"
 #include "apex/execution/vectorized_engine.h"
 
 #include <atomic>
@@ -29,6 +33,15 @@ namespace apex::core {
 using namespace apex::ingestion;
 using namespace apex::storage;
 using namespace apex::execution;
+
+// ============================================================================
+// StorageMode: N-4 스토리지 모드
+// ============================================================================
+enum class StorageMode : uint8_t {
+    PURE_IN_MEMORY = 0,  // HFT 극단적 틱 처리 전용 (HDB 비활성화)
+    TIERED         = 1,  // RDB(당일) + HDB(과거) 혼합 모드
+    PURE_ON_DISK   = 2,  // 백테스트/딥러닝 전용 (HDB만 사용)
+};
 
 // ============================================================================
 // QueryResult: 쿼리 결과 컨테이너
@@ -88,6 +101,19 @@ struct PipelineConfig {
 
     // 드레인 스레드 sleep (마이크로초)
     uint32_t drain_sleep_us = 10;
+
+    // -------------------------
+    // HDB / Tiered Storage 설정
+    // -------------------------
+
+    /// N-4 스토리지 모드
+    StorageMode storage_mode = StorageMode::PURE_IN_MEMORY;
+
+    /// HDB 루트 디렉토리 (Tiered / Pure On-Disk 모드에서 사용)
+    std::string hdb_base_path = "/tmp/apex_hdb";
+
+    /// FlushManager 설정 (Tiered 모드)
+    FlushConfig flush_config{};
 };
 
 // ============================================================================
@@ -141,6 +167,12 @@ public:
     [[nodiscard]] PartitionManager& partition_manager() { return partition_mgr_; }
     [[nodiscard]] TickPlant& tick_plant() { return tick_plant_; }
 
+    /// HDB 리더 접근 (Tiered/OnDisk 모드에서만 유효)
+    [[nodiscard]] HDBReader* hdb_reader() { return hdb_reader_.get(); }
+
+    /// FlushManager 접근 (Tiered 모드에서만 유효)
+    [[nodiscard]] FlushManager* flush_manager() { return flush_manager_.get(); }
+
     /// 큐 강제 드레인 (테스트용: 백그라운드 스레드 없이 동기 드레인)
     size_t drain_sync(size_t max_items = SIZE_MAX);
 
@@ -156,14 +188,6 @@ private:
         const int64_t* timestamps = nullptr;
         const int64_t* extra_col  = nullptr;  // query_filter_sum용 추가 컬럼
         size_t         count      = 0;
-    };
-
-    // Symbol → Partition* 인덱스 (쿼리 시 순회용)
-    // store_tick()에서 파티션 생성 시 업데이트
-    // 쿼리에서 read 시 shared_mutex 사용
-    struct PartitionEntry {
-        PartitionKey key;
-        Partition*   partition;
     };
 
     // ============================================================
@@ -182,6 +206,9 @@ private:
     // 파티션에서 ColumnSnapshot 빌드
     ColumnSnapshot build_snapshot(Partition* part, const std::string& extra_col_name) const;
 
+    // HDB에서 시간 범위 내 COUNT 집계
+    size_t hdb_count_range(SymbolId symbol, Timestamp from, Timestamp to) const;
+
     // ============================================================
     // 멤버
     // ============================================================
@@ -193,13 +220,17 @@ private:
     PipelineStats    stats_;
 
     // symbol → partition 인덱스
-    // 쓰기(store_tick): drain thread만 접근 → 뮤텍스 필요
-    // 읽기(query_*): 다른 스레드에서 접근 가능
     mutable std::mutex               partition_index_mu_;
     std::unordered_map<SymbolId, std::vector<Partition*>> partition_index_;
+
+    // HDB 컴포넌트 (Tiered / Pure On-Disk 모드에서만 생성)
+    std::unique_ptr<HDBWriter>    hdb_writer_;
+    std::unique_ptr<HDBReader>    hdb_reader_;
+    std::unique_ptr<FlushManager> flush_manager_;
 
     std::thread       drain_thread_;
     std::atomic<bool> running_{false};
 };
 
 } // namespace apex::core
+

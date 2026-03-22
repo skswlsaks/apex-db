@@ -1,0 +1,121 @@
+#pragma once
+// ============================================================================
+// Layer 1: FlushManager — RDB → HDB 비동기 라이프사이클 관리자
+// ============================================================================
+// 설계 원칙:
+//   - 백그라운드 스레드로 메모리 압력 모니터링
+//   - 임계치(기본 80%) 초과 시 SEALED 파티션 HDB로 비동기 플러시
+//   - 핫패스(인제스션) 완전 비차단 — SEALED 파티션만 처리
+//   - 플러시 후 ArenaAllocator 리셋으로 메모리 회수
+//   - Lock-free 원칙: 핫패스에 mutex 없음
+// ============================================================================
+
+#include "apex/common/types.h"
+#include "apex/common/logger.h"
+#include "apex/storage/partition_manager.h"
+#include "apex/storage/hdb_writer.h"
+
+#include <atomic>
+#include <cstdint>
+#include <string>
+#include <thread>
+
+namespace apex::storage {
+
+// ============================================================================
+// FlushConfig: 플러시 매니저 설정
+// ============================================================================
+struct FlushConfig {
+    /// 메모리 임계치 (0.0 ~ 1.0): 이 비율 초과 시 플러시 트리거
+    double   memory_threshold    = 0.8;
+
+    /// 메모리 모니터링 주기 (밀리초)
+    uint32_t check_interval_ms   = 1000;
+
+    /// LZ4 압축 사용 여부
+    bool     enable_compression  = true;
+
+    /// 플러시 후 아레나 리셋 (메모리 회수 여부)
+    bool     reclaim_after_flush = true;
+
+    /// 파티션을 자동 봉인하는 나이 기준 (시간 단위)
+    int64_t  auto_seal_age_hours = 1;
+};
+
+// ============================================================================
+// FlushStats: 플러시 통계
+// ============================================================================
+struct FlushStats {
+    uint64_t partitions_flushed  = 0;  // 총 플러시된 파티션 수
+    uint64_t total_bytes_written = 0;  // 총 기록 바이트
+    uint64_t flush_triggers      = 0;  // 임계치 초과로 인한 자동 플러시 횟수
+    uint64_t manual_flushes      = 0;  // 수동 flush_now() 호출 횟수
+    double   last_memory_ratio   = 0.0;// 마지막 메모리 사용률
+    int64_t  last_flush_ns       = 0;  // 마지막 플러시 타임스탬프 (ns)
+};
+
+// ============================================================================
+// FlushManager: 백그라운드 HDB 플러시 관리자
+// ============================================================================
+class FlushManager {
+public:
+    /// @param pm      PartitionManager 참조 (소유권 없음)
+    /// @param writer  HDBWriter 참조 (소유권 없음)
+    /// @param config  플러시 설정
+    FlushManager(PartitionManager& pm,
+                 HDBWriter&         writer,
+                 FlushConfig        config = {});
+
+    ~FlushManager();
+
+    // Non-copyable
+    FlushManager(const FlushManager&) = delete;
+    FlushManager& operator=(const FlushManager&) = delete;
+
+    /// 백그라운드 플러시 스레드 시작
+    void start();
+
+    /// 백그라운드 플러시 스레드 중지 (join 대기)
+    void stop();
+
+    /// 수동 즉시 플러시 — 현재 모든 SEALED 파티션 동기 플러시
+    /// @return 플러시된 파티션 수
+    size_t flush_now();
+
+    /// 현재 통계 스냅샷
+    [[nodiscard]] FlushStats stats() const;
+
+    /// 현재 실행 중인지 여부
+    [[nodiscard]] bool running() const {
+        return running_.load(std::memory_order_acquire);
+    }
+
+private:
+    /// 백그라운드 루프
+    void flush_loop();
+
+    /// 모든 SEALED 파티션 플러시 (내부 공통 로직)
+    size_t do_flush_sealed();
+
+    /// 현재 시간 (나노초)
+    static int64_t now_ns();
+
+    PartitionManager&  pm_;
+    HDBWriter&         writer_;
+    FlushConfig        config_;
+
+    std::thread        flush_thread_;
+    std::atomic<bool>  running_{false};
+
+    // 통계 (원자적 업데이트)
+    std::atomic<uint64_t> stat_partitions_flushed_{0};
+    std::atomic<uint64_t> stat_bytes_written_{0};
+    std::atomic<uint64_t> stat_flush_triggers_{0};
+    std::atomic<uint64_t> stat_manual_flushes_{0};
+    std::atomic<int64_t>  stat_last_flush_ns_{0};
+
+    // 마지막 메모리 비율 (double을 atomic으로 저장하기 위해 uint64 비트캐스트)
+    std::atomic<uint64_t> stat_last_memory_ratio_bits_{0};
+};
+
+} // namespace apex::storage

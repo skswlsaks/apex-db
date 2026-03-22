@@ -9,11 +9,13 @@ add_executable(apex_tests
     unit/test_ring_buffer.cpp
     unit/test_tick_plant.cpp
     unit/test_vectorized_engine.cpp
+    unit/test_hdb.cpp
 )
 target_link_libraries(apex_tests PRIVATE
     apex_storage
     apex_ingestion
     apex_execution
+    apex_core
     GTest::gtest_main
 )
 

@@ -76,6 +76,13 @@ public:
     /// 상태 전이
     void set_state(State s) { state_ = s; }
 
+    /// 플러시 완료 후 아레나 메모리 회수 (재사용 불가, 데이터 무효화)
+    void reclaim_arena() {
+        if (arena_) {
+            arena_->reset();
+        }
+    }
+
 private:
     PartitionKey                              key_;
     State                                     state_ = State::ACTIVE;
@@ -96,6 +103,9 @@ public:
 
     /// 임계 메모리 도달 시 오래된 ACTIVE 파티션을 SEALED로 전환
     std::vector<Partition*> seal_old_partitions(Timestamp current_ts, int64_t max_age_hours = 1);
+
+    /// SEALED 상태인 파티션 목록 반환 (FlushManager에서 사용)
+    std::vector<Partition*> get_sealed_partitions();
 
     /// 전체 파티션 수
     [[nodiscard]] size_t partition_count() const { return partitions_.size(); }
