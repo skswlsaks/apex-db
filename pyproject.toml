@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "apex-py"
+version = "0.1.0"
+description = "Python client and DataFrame integration for APEX-DB"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+
+# Core runtime — pure stdlib, zero mandatory dependencies
+dependencies = []
+
+[project.optional-dependencies]
+pandas = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+]
+polars = [
+    "polars>=0.20",
+]
+arrow = [
+    "pyarrow>=14.0",
+]
+duckdb = [
+    "duckdb>=0.9",
+]
+all = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "polars>=0.20",
+    "pyarrow>=14.0",
+    "duckdb>=0.9",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "polars>=0.20",
+    "pyarrow>=14.0",
+    "duckdb>=0.9",
+]
+
+[project.urls]
+Homepage   = "https://github.com/openclaw/apex-db"
+Repository = "https://github.com/openclaw/apex-db"
+
+[tool.setuptools.packages.find]
+where   = ["."]
+include = ["apex_py*"]
+
+# ============================================================================
+# pytest
+# ============================================================================
+
+[tool.pytest.ini_options]
+testpaths   = ["tests/python"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+# ============================================================================
+# coverage
+# ============================================================================
+
+[tool.coverage.run]
+source  = ["apex_py"]
+omit    = ["tests/*", "*/site-packages/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false

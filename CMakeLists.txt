@@ -502,6 +502,8 @@ if(APEX_BUILD_PYTHON)
     # Python 모듈 빌드
     pybind11_add_module(apex
         src/transpiler/python_binding.cpp
+        src/python/arrow_bridge.cpp
+        src/python/dataframe_bridge.cpp
     )
     target_include_directories(apex PRIVATE
         ${CMAKE_SOURCE_DIR}/include
@@ -520,20 +522,31 @@ if(APEX_BUILD_PYTHON)
         -Wno-unused-parameter
     )
 
-    # 빌드 디렉토리에 apex_py/dsl.py 복사 (테스트 시 import 용이)
+    # 빌드 디렉토리에 apex_py 패키지 복사 (테스트 시 import 용이)
     file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/apex_py")
     configure_file(
         "${CMAKE_SOURCE_DIR}/src/transpiler/apex_py/dsl.py"
         "${CMAKE_BINARY_DIR}/apex_py/dsl.py"
         COPYONLY
     )
-    # apex 패키지로 인식되도록 __init__.py 생성
-    file(WRITE "${CMAKE_BINARY_DIR}/apex_py/__init__.py"
-        "# apex_py — APEX-DB lazy DSL package\n"
-        "from .dsl import DataFrame, LazyResult\n"
-        "__all__ = ['DataFrame', 'LazyResult']\n"
+
+    # apex_py Python 패키지 파일 복사
+    foreach(_py_file
+        __init__.py
+        connection.py
+        dataframe.py
+        streaming.py
+        arrow.py
+        utils.py
     )
-    message(STATUS "Python module: apex (+ apex_py DSL)")
+        configure_file(
+            "${CMAKE_SOURCE_DIR}/apex_py/${_py_file}"
+            "${CMAKE_BINARY_DIR}/apex_py/${_py_file}"
+            COPYONLY
+        )
+    endforeach()
+
+    message(STATUS "Python module: apex (+ apex_py pandas/polars/arrow integration)")
 endif()
 
 # ============================================================================
