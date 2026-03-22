@@ -173,10 +173,21 @@ auto result = executor.execute(ast);
 
 ## 5. 향후 로드맵
 
+- [x] **마이그레이션 툴킷** (apex-migrate CLI, kdb+/ClickHouse/DuckDB/TimescaleDB) ✅
 - [ ] SQL Window 함수 RANGE 모드 (현재 ROWS만)
 - [ ] Python DSL → LLVM JIT 직접 컴파일 (원래 설계 완성)
 - [ ] ClickHouse wire protocol 호환 (TCP 바이너리)
 - [ ] Grafana 공식 플러그인
+---
+
+## 6. 스트리밍 연동 (백로그)
+
+계획된 데이터 소스 커넥터 (BACKLOG.md 참조):
+- Kafka/Redpanda/Pulsar (librdkafka, C++ 클라이언트)
+- AWS Kinesis, Azure Event Hubs, Google Pub/Sub
+- PostgreSQL WAL (CDC), MySQL binlog, MongoDB Change Streams
+- 거래소 직접 연결: CME FAST, OPRA, CBOE PITCH, Coinbase, Bybit
+
 - [ ] Python 에코시스템 통합
   - [ ] `apex.from_polars(df)` — zero-copy (1-2주)
   - [ ] `apex.from_pandas(df)` — 변환 (1주)

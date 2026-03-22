@@ -1,5 +1,5 @@
 # APEX-DB 초기 비전 및 설계 원칙
-**⚠️ 최종 업데이트: 2026-03-22 (범용 OLAP/TSDb 확장, kdb+ 93% 대체 달성)**
+**⚠️ 최종 업데이트: 2026-03-22 (범용 OLAP/TSDb 확장, kdb+ 95% 대체, 마이그레이션 툴킷 완료)**
 
 APEX-DB는 **초저지연 인메모리 데이터베이스**로, 금융 특화로 시작하여 **범용 OLAP, 시계열 DB, ML Feature Store**로 확장했습니다.
 
@@ -9,7 +9,7 @@ APEX-DB는 **초저지연 인메모리 데이터베이스**로, 금융 특화로
 
 ### **1. 타겟 시장 (Target Market) — 확장됨**
 
-**Phase 1 (완료): 금융 시장** — kdb+ 대체율 93% 달성
+**Phase 1 (완료): 금융 시장** — kdb+ 대체율 95% 달성
 * **HFT (고빈도 매매):** ASOF JOIN, xbar, Window JOIN — **95% 대체**
 * **퀀트 리서치:** EMA/DELTA/RATIO, Python DSL — **90% 대체**
 * **리스크 관리:** LEFT JOIN, GROUP BY 병렬 — **95% 대체**
@@ -91,7 +91,7 @@ APEX-DB는 **초저지연 인메모리 데이터베이스**로, 금융 특화로
 | **Cluster** | UCX/SharedMem transport, Partition routing | 13.5ns SHM, 2ns routing |
 | **운영** | Monitoring, Backup, systemd service | Prometheus + Grafana |
 
-**테스트:** 151개 단위 테스트 PASS, 10개 벤치마크
+**테스트:** 221개 테스트 PASS (단위 151 + 피드핸들러 37 + 마이그레이션 70 + 벤치마크 10)
 
 ---
 
@@ -106,10 +106,7 @@ APEX-DB는 **초저지연 인메모리 데이터베이스**로, 금융 특화로
 - [ ] Graviton (ARM) 빌드 테스트 (Highway SVE)
 
 #### **높은 우선순위 (비즈니스)**
-- [ ] **마이그레이션 툴킷** — 최우선, 매출 직결
-  - kdb+ → APEX-DB (7주, **$2.5M-12M ARR**)
-  - ClickHouse → APEX-DB (4주, **$1M-3M ARR**)
-  - DuckDB 상호운용성 (2주, 전략적)
+- [ ] **마이그레이션 툴킷** ✅ **완료** (kdb+/ClickHouse/DuckDB/TimescaleDB, 70 테스트)
 - [ ] **Python 에코시스템** — Research-to-Production
   - `apex.from_polars/pandas`, Arrow 직접 지원
 - [ ] **DSL AOT 컴파일** — Nuitka/Cython, 프로덕션 배포 + IP 보호

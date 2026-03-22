@@ -330,6 +330,24 @@ target_link_libraries(apex-migrate PRIVATE
 )
 target_compile_options(apex-migrate PRIVATE -O2)
 
+# Interactive SQL CLI
+add_executable(apex-cli
+    tools/apex-cli.cpp
+)
+target_include_directories(apex-cli PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(apex-cli PRIVATE
+    apex_common
+)
+# Link readline if available
+find_library(READLINE_LIB readline)
+if(READLINE_LIB)
+    target_link_libraries(apex-cli PRIVATE ${READLINE_LIB})
+    target_compile_definitions(apex-cli PRIVATE HAVE_READLINE=1)
+endif()
+target_compile_options(apex-cli PRIVATE -O2)
+
 # ============================================================================
 # Tests
 # ============================================================================
