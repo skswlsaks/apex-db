@@ -16,9 +16,10 @@ add_executable(apex_tests
     unit/test_join_window.cpp
     unit/test_financial_functions.cpp
     unit/test_parallel.cpp
+    unit/test_auth.cpp
 )
 target_include_directories(apex_tests PRIVATE
-    ${CMAKE_SOURCE_DIR}/src/cluster   # shm_backend.h 접근
+    ${CMAKE_SOURCE_DIR}/src/cluster   # shm_backend.h access
 )
 target_link_libraries(apex_tests PRIVATE
     apex_storage
@@ -27,8 +28,12 @@ target_link_libraries(apex_tests PRIVATE
     apex_core
     apex_cluster
     apex_sql
+    apex_auth
     GTest::gtest_main
 )
+if(APEX_HAS_OPENSSL)
+    target_link_libraries(apex_tests PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
 
 include(GoogleTest)
 gtest_discover_tests(apex_tests)

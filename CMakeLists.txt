@@ -130,6 +130,16 @@ if(APEX_USE_S3)
     endif()
 endif()
 
+# --- OpenSSL (TLS + crypto for auth) ---
+find_package(OpenSSL QUIET)
+if(OpenSSL_FOUND OR OPENSSL_FOUND)
+    message(STATUS "OpenSSL: ${OPENSSL_VERSION} (TLS + JWT/auth enabled)")
+    set(APEX_HAS_OPENSSL ON)
+else()
+    message(STATUS "OpenSSL: not found — TLS and JWT auth disabled")
+    set(APEX_HAS_OPENSSL OFF)
+endif()
+
 # --- LZ4 (optional) ---
 if(APEX_USE_LZ4)
     find_package(PkgConfig REQUIRED)
@@ -254,6 +264,7 @@ if(APEX_USE_JIT)
 endif()
 target_include_directories(apex_execution PUBLIC
     ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src   # Highway foreach_target.h needs src/ in path
 )
 find_package(Threads REQUIRED)
 target_link_libraries(apex_execution PUBLIC
@@ -300,20 +311,47 @@ target_link_libraries(apex_sql PUBLIC
     apex_core
 )
 
+# --- Auth Library (RBAC + API Key + JWT + AuthManager + Rate Limiting + Secrets) ---
+add_library(apex_auth STATIC
+    src/auth/api_key_store.cpp
+    src/auth/jwt_validator.cpp
+    src/auth/auth_manager.cpp
+    src/auth/rate_limiter.cpp
+    src/auth/secrets_provider.cpp
+    src/auth/query_tracker.cpp
+)
+target_include_directories(apex_auth PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}   # third_party/httplib.h (used by secrets_provider)
+)
+target_link_libraries(apex_auth PUBLIC
+    apex_common
+    spdlog::spdlog
+)
+if(APEX_HAS_OPENSSL)
+    target_link_libraries(apex_auth PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(apex_auth PUBLIC APEX_AUTH_OPENSSL=1)
+endif()
+
 # --- Layer 6: HTTP API Server ---
 add_library(apex_server STATIC
     src/server/http_server.cpp
 )
 target_include_directories(apex_server PUBLIC
     ${CMAKE_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}  # third_party/httplib.h 접근용
+    ${CMAKE_SOURCE_DIR}  # third_party/httplib.h access
 )
 target_link_libraries(apex_server PUBLIC
     apex_sql
+    apex_auth
 )
-# httplib은 POSIX threads 필요
+# httplib requires POSIX threads
 find_package(Threads REQUIRED)
 target_link_libraries(apex_server PUBLIC Threads::Threads)
+if(APEX_HAS_OPENSSL)
+    target_link_libraries(apex_server PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(apex_server PUBLIC APEX_TLS_ENABLED=1)
+endif()
 
 # --- Phase C: Cluster (분산 메모리 & 트랜스포트) ---
 add_library(apex_cluster STATIC
