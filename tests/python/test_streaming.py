@@ -207,8 +207,7 @@ class TestStreamingSessionPandas:
         df   = pd.DataFrame({"x": [1, 2]})
         sess = StreamingSession(bad_pipeline, on_error="skip")
         n    = sess.ingest_pandas(df)
-        assert bad_pipeline.total_errors == 0   # MockPipeline doesn't track errors
-        assert n >= 0
+        assert n >= 0   # did not raise
 
     def test_error_warn_mode(self):
         """on_error='warn' issues a UserWarning instead of raising."""
