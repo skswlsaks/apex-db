@@ -95,28 +95,34 @@
   - `examples/feed_handler_integration.cpp` - 통합 예제
   - `docs/feeds/FEED_HANDLER_GUIDE.md` - 사용 가이드
   - **비즈니스 가치:** HFT 시장 진입 ($2.5M-12M), 거래소 직접 연결, kdb+ 완전 대체
-- [ ] **마이그레이션 툴킷** — 경쟁 제품 → APEX-DB 자동 변환 (고객 확보 핵심)
-  - **Priority 0: kdb+ → APEX-DB** (7주, $2.5M-12M ARR)
-    - q → SQL 트랜스파일러 (4주) - select/where/fby/aj/wj 자동 변환
-    - HDB 데이터 로더 (2주) - Splayed tables → Columnar format
-    - 성능 검증 도구 (1주) - TPC-H + 금융 쿼리 벤치마크
-    - **비즈니스 가치:** HFT 시장 진입, 가장 큰 ARPU ($250K-500K/고객)
-  - **Priority 1: ClickHouse → APEX-DB** (4주, $1M-3M ARR)
-    - SQL 방언 변환 (1주) - arrayJoin/uniq → UNNEST/COUNT(DISTINCT)
-    - 데이터 마이그레이션 (1주) - MergeTree → Columnar
-    - 쿼리 최적화 (1주) - 느린 쿼리 감지 + Index 추천
-    - PoC 자동화 (1주) - 원클릭 마이그레이션
-    - **비즈니스 가치:** 빠른 첫 매출 (3개월), 광고 테크/SaaS 분석 시장
-  - **Priority 1: DuckDB 상호운용성** (2주, 전략적)
-    - DuckDB Parquet → APEX-DB (1주) - Arrow zero-copy
-    - 벤치마크 + 블로그 (1주) - "DuckDB의 실시간 버전"
-    - **비즈니스 가치:** Hacker News 론칭, 인바운드 리드 50-100/월, Python 커뮤니티
-  - **Priority 2: TimescaleDB → APEX-DB** (3주, $500K-1M ARR)
-    - 스키마 변환 (1주) - Hypertables → APEX-DB tables
-    - pg_dump 자동 변환 (1주)
-    - 함수 매핑 (1주) - time_bucket → xbar
-    - **비즈니스 가치:** IoT/DevOps 모니터링 시장
-  - **전략적: Snowflake/Delta Lake Hybrid 지원** (4주, $3.5M ARR)
+- [x] **마이그레이션 툴킷** ✅ 완료 (2026-03-22)
+  - **kdb+ → APEX-DB** ✅ 완료
+    - `include/apex/migration/q_parser.h` - AST 아키텍처
+    - `src/migration/q_lexer.cpp` - q 언어 Lexer
+    - `src/migration/q_parser.cpp` - q AST Parser
+    - `src/migration/q_to_sql.cpp` - q→SQL Transformer (wavg/xbar/aj/wj)
+    - `include/apex/migration/hdb_loader.h` + `src/migration/hdb_loader.cpp` - HDB 스플레이 테이블 로더 (mmap 기반)
+    - `tools/apex-migrate.cpp` - CLI (query/hdb/clickhouse/duckdb/timescaledb 모드)
+    - `tests/migration/test_q_to_sql.cpp` - 20개 테스트
+    - `tests/migration/test_hdb_loader.cpp` - 15개 테스트
+  - **ClickHouse → APEX-DB** ✅ 완료
+    - `include/apex/migration/clickhouse_migrator.h` + `src/migration/clickhouse_migrator.cpp`
+    - DDL 생성 (MergeTree/LowCardinality/Gorilla codec), kdb+ 타입 매핑
+    - ASOF JOIN 변환, xbar→toStartOfInterval, FIRST/LAST→argMin/argMax
+    - `tests/migration/test_clickhouse.cpp` - 18개 테스트
+  - **DuckDB 상호운용성** ✅ 완료
+    - `include/apex/migration/duckdb_interop.h` + `src/migration/duckdb_interop.cpp`
+    - Parquet 내보내기 (SNAPPY/ZSTD/GZIP), hive partitioning, Arrow 스키마
+    - DuckDB setup.sql 생성, Jupyter notebook 템플릿 생성
+    - `tests/migration/test_duckdb.cpp` - 17개 테스트
+  - **TimescaleDB → APEX-DB** ✅ 완료
+    - `include/apex/migration/timescaledb_migrator.h` + `src/migration/timescaledb_migrator.cpp`
+    - Hypertable DDL, Continuous Aggregate (candlestick/vwap/ohlcv), Compression Policy
+    - xbar→time_bucket, FIRST/LAST→first(col,ts), ASOF→LATERAL 변환
+    - TimescaleDB Toolkit: candlestick_agg, stats_agg 예제 생성
+    - `tests/migration/test_timescaledb.cpp` - 18개 테스트
+  - **총 테스트: 70개** (q→SQL 20, HDB 15, ClickHouse 18, DuckDB 17, TimescaleDB 18)
+  - **전략적 백로그: Snowflake/Delta Lake Hybrid 지원** (4주, $3.5M ARR)
     - Snowflake 커넥터 (2주) - JDBC/ODBC 통합, Cold data 쿼리
     - Delta Lake Reader (2주) - Parquet + transaction log 읽기
     - Hybrid 아키텍처 가이드 - "Snowflake for batch, APEX-DB for real-time"
@@ -196,6 +202,30 @@
 - [ ] **공식 Python 패키지** — `pip install apex-db`
   - PyPI 배포, `apex.connect("localhost:8123")`
   - **비즈니스 가치:** 개발자 채택률 10x
+
+## 스트리밍 데이터 연동
+- [ ] **Apache Kafka 컨슈머** — Kafka 토픽 → APEX-DB 실시간 인제스션
+  - librdkafka C++ 클라이언트 통합
+  - 토픽 파티션 → APEX-DB 파티션 자동 매핑
+  - 오프셋 관리 (at-least-once, exactly-once 지원)
+  - Avro/Protobuf/JSON 스키마 자동 디코딩
+  - **구현 위치:** `src/feeds/kafka_consumer.cpp`, `include/apex/feeds/kafka_consumer.h`
+  - **비즈니스 가치:** 기업 데이터 파이프라인 연결 핵심 (Kafka는 표준 인프라)
+  - **타겟:** 핀테크, 광고 테크, 전자상거래 실시간 분석
+- [ ] **Kafka Connect Sink** — APEX-DB를 Kafka Connect 싱크로 등록
+  - Kafka Connect JSON 커넥터 플러그인 (Java 또는 REST 브릿지)
+  - 코드 없이 Kafka 스트림 → APEX-DB 연결
+  - **비즈니스 가치:** DevOps/데이터 엔지니어링 팀 self-service 채택
+- [ ] **Apache Pulsar 컨슈머** — Pulsar 메시지 → APEX-DB
+  - Pulsar C++ 클라이언트 통합
+  - **비즈니스 가치:** Pulsar 사용 조직 (Tencent, Yahoo, Verizon 계열)
+- [ ] **Redpanda 호환** — Kafka API 호환 브로커 (Redpanda, WarpStream)
+  - Kafka 컨슈머 코드 재사용 (API 호환)
+  - **비즈니스 가치:** Kafka 대체 브로커 사용 고객 자동 지원
+- [ ] **AWS Kinesis 컨슈머** — Kinesis Data Streams → APEX-DB
+  - AWS SDK C++ 통합
+  - KCL 없이 shard 직접 폴링
+  - **비즈니스 가치:** AWS 네이티브 고객 (Kinesis 사용 중인 핀테크/광고 테크)
 
 ## Physical AI / 산업 특화
 - [ ] **ROS2 플러그인** — ROS2 토픽 → APEX-DB 직접 인제스션

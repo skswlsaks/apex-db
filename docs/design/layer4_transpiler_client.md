@@ -1,5 +1,5 @@
 # Layer 4: Client & Transpilation Layer
-# ⚠️ 최종 업데이트: 2026-03-22 (실제 구현 반영)
+# ⚠️ 최종 업데이트: 2026-03-22 (pybind11, DSL, SQL, 금융 함수, 병렬 쿼리 반영)
 
 본 문서는 APEX-DB의 클라이언트 인터페이스 레이어 설계 및 구현 현황입니다.
 
@@ -101,6 +101,36 @@ SELECT symbol, price,
        LAG(price, 1) OVER (PARTITION BY symbol) AS prev_price,
        RANK() OVER (ORDER BY price DESC) AS rank
 FROM trades
+
+-- 금융 함수 (kdb+ 호환)
+SELECT xbar(timestamp, 300000000000) AS bar,
+       first(price) AS open,
+       max(price) AS high,
+       min(price) AS low,
+       last(price) AS close,
+       sum(volume) AS volume
+FROM trades WHERE symbol = 1
+GROUP BY xbar(timestamp, 300000000000)
+
+-- Window 함수 (EMA, DELTA, RATIO)
+SELECT symbol, price,
+       EMA(price, 0.1) OVER (PARTITION BY symbol ORDER BY timestamp) AS ema_slow,
+       EMA(price, 20) OVER (PARTITION BY symbol ORDER BY timestamp) AS ema20,
+       DELTA(price) OVER (ORDER BY timestamp) AS price_change,
+       RATIO(price) OVER (ORDER BY timestamp) AS price_ratio
+FROM trades
+
+-- LEFT JOIN (NULL 센티넬)
+SELECT t.price, t.volume, r.risk_score
+FROM trades t
+LEFT JOIN risk_factors r ON t.symbol = r.symbol
+
+-- Window JOIN (wj)
+SELECT t.price, wj_avg(q.bid) AS avg_bid, wj_count(q.bid) AS quote_count
+FROM trades t
+WINDOW JOIN quotes q
+ON t.symbol = q.symbol
+AND q.timestamp BETWEEN t.timestamp - 5000000000 AND t.timestamp + 5000000000
 ```
 
 ---
@@ -116,9 +146,38 @@ FROM trades
 
 ---
 
-## 4. 향후 로드맵
+## 4. 병렬 쿼리 (QueryScheduler DI)
+
+**현재 구현:** LocalQueryScheduler — scatter/gather 패턴
+
+```python
+# Python DSL에서 병렬 쿼리 자동 활성화
+db = apex.Pipeline(num_threads=8)
+result = db.execute_sql(
+    "SELECT symbol, sum(volume) FROM trades GROUP BY symbol"
+)
+# → 8스레드 병렬, 3.48x 속도 향상
+```
+
+**C++ API:**
+```cpp
+auto scheduler = std::make_unique<LocalQueryScheduler>(8);  // 8 threads
+QueryExecutor executor(pipeline, std::move(scheduler));
+auto result = executor.execute(ast);
+// → 자동 scatter/gather, 0.248ms vs 0.862ms (직렬)
+```
+
+**향후:** DistributedQueryScheduler (UCX 기반) — 코드 변경 없이 멀티노드 확장
+
+---
+
+## 5. 향후 로드맵
 
 - [ ] SQL Window 함수 RANGE 모드 (현재 ROWS만)
 - [ ] Python DSL → LLVM JIT 직접 컴파일 (원래 설계 완성)
 - [ ] ClickHouse wire protocol 호환 (TCP 바이너리)
 - [ ] Grafana 공식 플러그인
+- [ ] Python 에코시스템 통합
+  - [ ] `apex.from_polars(df)` — zero-copy (1-2주)
+  - [ ] `apex.from_pandas(df)` — 변환 (1주)
+  - [ ] Arrow 직접 지원 (3-4주)

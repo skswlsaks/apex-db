@@ -30,16 +30,14 @@ kdb+/q의 기능을 전수 조사하고, APEX-DB 현재 상태와 비교.
 | 벡터 연산 | 컬럼 전체에 대한 일괄 연산 | Highway SIMD | ✅ |
 | 집계 (sum, avg, min, max, count) | 기본 집계 | ✅ 구현 | ✅ |
 | VWAP (wavg) | 가중 평균 | VWAP 함수 | ✅ |
-| xbar | 시간 바 집계 (5분봉 등) | ❌ 미구현 | 🔴 |
-| ema (지수이동평균) | 금융 핵심 지표 | ❌ 미구현 | 🔴 |
+| xbar | 시간 바 집계 (5분봉 등) | **xbar() 네이티브** | ✅ |
+| ema (지수이동평균) | 금융 핵심 지표 | **EMA() OVER** | ✅ |
 | mavg, msum, mmin, mmax | 이동 평균/합계/최소/최대 | Window SUM/AVG/MIN/MAX | ✅ |
-| deltas, ratios | 행 간 차이, 비율 | LAG로 계산 가능 | ⚠️ |
+| deltas, ratios | 행 간 차이, 비율 | **DELTA/RATIO OVER** | ✅ |
 | within | 범위 체크 | BETWEEN | ✅ |
-| each, peach | 벡터/병렬 맵 | ❌ (Python DSL로 대체) | ⚠️ |
+| each, peach | 벡터/병렬 맵 | LocalQueryScheduler | ✅ |
 
-**핵심 갭:**
-- **`xbar`**: 금융에서 매우 자주 사용 (5분봉, 1시간봉). GROUP BY + 시간 floor로 구현 가능
-- **`ema`**: 지수이동평균. 별도 구현 필요 (O(n) 단순 루프)
+**완료!** 모든 핵심 금융 함수 구현됨 (devlog #010)
 
 ### C. JOIN 연산
 
@@ -48,30 +46,29 @@ kdb+/q의 기능을 전수 조사하고, APEX-DB 현재 상태와 비교.
 | aj (asof join) | 시계열 조인 | AsofJoinOperator | ✅ |
 | aj0 | 왼쪽 컬럼만 반환 | 변형으로 가능 | ⚠️ |
 | ij (inner join) | 내부 조인 | HashJoinOperator | ✅ |
-| lj (left join) | 왼쪽 조인 | ❌ 미구현 | 🔴 |
+| lj (left join) | 왼쪽 조인 | **HashJoinOperator (LEFT)** | ✅ |
 | uj (union join) | 합집합 조인 | ❌ 미구현 | 🟡 |
-| wj (window join) | 시간 윈도우 조인 | ❌ 미구현 | 🔴 |
+| wj (window join) | 시간 윈도우 조인 | **WindowJoinOperator** | ✅ |
 | ej (equi join) | 등가 조인 | HashJoinOperator | ✅ |
 | pj (plus join) | 덧셈 조인 | ❌ 미구현 | 🟡 |
 
-**핵심 갭:**
-- **`wj` (window join)**: "이 시점 전후 5초 이내의 호가를 모두 가져와라" — HFT 핵심
-- **`lj` (left join)**: 기본 SQL LEFT JOIN — 구현 쉬움
+**완료!** 핵심 JOIN 모두 구현 (devlog #010)
+- wj: O(n log m) 이진 탐색, wj_avg/sum/count/min/max
+- lj: NULL 센티넬 (INT64_MIN)
 
 ### D. 시스템 & 운영
 
 | kdb+ 기능 | 설명 | APEX-DB | 상태 |
 |---|---|---|---|
-| IPC 프로토콜 | 프로세스 간 통신 | HTTP API + gRPC(계획) | ⚠️ |
+| IPC 프로토콜 | 프로세스 간 통신 | HTTP API + UCX | ✅ |
 | 멀티프로세스 (TP/RDB/HDB/GW) | 역할별 프로세스 분리 | Pipeline 단일 + 분산 | ⚠️ |
 | Gateway | 쿼리 라우팅 | PartitionRouter | ✅ |
-| -s secondary threads | 병렬 쿼리 | ❌ 단일 스레드 쿼리 | 🔴 |
+| -s secondary threads | 병렬 쿼리 | **LocalQueryScheduler** | ✅ |
 | .z.ts 타이머 | 스케줄링 | ❌ | 🟡 |
 | \t 타이밍 | 쿼리 벤치마크 | execution_time_us | ✅ |
 
-**핵심 갭:**
-- **병렬 쿼리 실행**: 현재 쿼리가 단일 스레드. 멀티스레드 쿼리 필요
-- **프로세스 역할 분리**: kdb+는 TP/RDB/HDB/Gateway 별도 프로세스. APEX-DB는 통합형
+**남은 갭:**
+- **프로세스 역할 분리**: kdb+는 TP/RDB/HDB/Gateway 별도 프로세스. APEX-DB는 통합형 (향후 분산 스케줄러로 해결)
 
 ### E. Python 연동
 
@@ -87,24 +84,31 @@ kdb+/q의 기능을 전수 조사하고, APEX-DB 현재 상태와 비교.
 
 ## 2. 핵심 갭 요약 (kdb+ 대체 위해 반드시 필요한 것)
 
-### 🔴 긴급 (없으면 대체 불가)
+### ✅ 완료 (2026-03-22)
 
-| 기능 | 이유 | 난이도 | 예상 시간 |
+모든 긴급 갭이 구현 완료되었습니다!
+
+| 기능 | 상태 | 성능 | devlog |
 |---|---|---|---|
-| **xbar (시간 바)** | 5분봉, 1시간봉 — 금융 기본 | ⭐ | 2시간 |
-| **ema (지수이동평균)** | 기술적 지표 핵심 | ⭐ | 1시간 |
-| **lj (LEFT JOIN)** | SQL 기본, 분석 필수 | ⭐⭐ | 3시간 |
-| **wj (Window JOIN)** | HFT 호가 분석 핵심 | ⭐⭐⭐ | 1일 |
-| **병렬 쿼리 실행** | 대량 데이터 쿼리 속도 | ⭐⭐⭐ | 2일 |
+| **xbar (시간 바)** | ✅ | 1M rows → 3,334 bars in **24ms** | devlog #010 |
+| **ema (지수이동평균)** | ✅ | 1M rows in **2.2ms** | devlog #010 |
+| **LEFT JOIN** | ✅ | NULL 센티넬 (INT64_MIN) | devlog #010 |
+| **Window JOIN (wj)** | ✅ | O(n log m) 이진 탐색 | devlog #010 |
+| **병렬 쿼리 실행** | ✅ | 8 threads = **3.48x** 가속 | devlog #011 |
+| **deltas/ratios** | ✅ | OVER 윈도우 함수 | devlog #010 |
+| **FIRST/LAST 집계** | ✅ | OHLC 캔들차트용 | devlog #010 |
 
-### 🟡 중요 (없어도 되지만 있으면 경쟁력 상승)
+**151개 테스트 PASS** (devlog #010: 29개 신규, devlog #011: 27개 신규)
+
+### 🟡 향후 개선 (없어도 kdb+ 95% 대체 가능)
 
 | 기능 | 이유 | 난이도 |
 |---|---|---|
-| deltas/ratios 네이티브 | LAG 대신 전용 함수 | ⭐ |
+| RIGHT JOIN, FULL OUTER JOIN | SQL 표준 완성 | ⭐⭐ |
 | uj (union join) | 테이블 합치기 | ⭐⭐ |
 | Attribute 힌트 (s#, g#) | 쿼리 최적화 | ⭐⭐ |
 | 타이머/스케줄러 | EOD 자동화 | ⭐⭐ |
+| Window JOIN 슬라이딩 윈도우 | O(n+m) 최적화 | ⭐⭐⭐ |
 
 ### ✅ 이미 kdb+보다 나은 것
 
@@ -121,36 +125,48 @@ kdb+/q의 기능을 전수 조사하고, APEX-DB 현재 상태와 비교.
 
 ---
 
-## 3. 대체 가능성 판정
+## 3. 대체 가능성 판정 (2026-03-22 업데이트)
 
 ### HFT (틱 처리 + 실시간 쿼리)
-**현재: 80% 대체 가능**
-- ✅ 인제스션, RDB/HDB, VWAP, ASOF JOIN
-- 🔴 누락: xbar, ema, wj, 병렬 쿼리
-- 구현하면: **95% 대체 가능**
+**✅ 95% 대체 가능** (목표 달성!)
+- ✅ 인제스션 (5.52M ticks/sec)
+- ✅ RDB/HDB + LZ4 압축 (4.8 GB/s)
+- ✅ VWAP, ASOF JOIN
+- ✅ xbar (시간 바), ema (지수이동평균)
+- ✅ Window JOIN (wj) — 호가 시간 윈도우 조인
+- ✅ 병렬 쿼리 (8T = 3.48x)
+- ⚠️ 남은 5%: RIGHT/FULL JOIN, uj, Attribute 힌트
 
 ### 퀀트 리서치 (백테스트)
-**현재: 70% 대체 가능**
-- ✅ Python DSL, Window 함수, GROUP BY
-- 🔴 누락: ema, xbar, wj, 복잡한 조인
-- 구현하면: **90% 대체 가능**
+**✅ 90% 대체 가능** (목표 달성!)
+- ✅ Python zero-copy (522ns)
+- ✅ Window 함수 (SUM/AVG/MIN/MAX/LAG/LEAD/ROW_NUMBER/RANK OVER)
+- ✅ EMA, DELTA, RATIO
+- ✅ GROUP BY + xbar (캔들차트)
+- ✅ LEFT JOIN, Window JOIN
+- ✅ FIRST/LAST 집계
+- ⚠️ 남은 10%: 스케줄러, 타이머
 
 ### 리스크/컴플라이언스
-**현재: 85% 대체 가능**
-- ✅ SQL, Hash JOIN, GROUP BY
-- 🔴 누락: LEFT JOIN, 병렬 쿼리
-- 구현하면: **95% 대체 가능**
+**✅ 95% 대체 가능** (목표 달성!)
+- ✅ SQL 파서 + HTTP API (port 8123)
+- ✅ Hash JOIN (INNER, LEFT)
+- ✅ GROUP BY 집계
+- ✅ 병렬 쿼리
+- ⚠️ 남은 5%: RIGHT/FULL JOIN, union join
 
 ---
 
-## 4. 추천 액션 플랜
+## 4. 완료된 액션 플랜 ✅
 
-**1주일이면 kdb+ 90%+ 대체 가능 수준 도달:**
+**예상: 1주일 → 실제: 2일 완료** (2026-03-22)
 
-| 일차 | 작업 | 시간 |
+| 일차 | 작업 | 상태 |
 |---|---|---|
-| Day 1 | xbar + ema + deltas/ratios | 4h |
-| Day 2 | LEFT JOIN + Window JOIN (wj) | 8h |
-| Day 3 | 병렬 쿼리 실행 (thread pool) | 8h |
-| Day 4 | 통합 테스트 + 벤치마크 | 4h |
-| Day 5 | 문서 + kdb+ 마이그레이션 가이드 | 4h |
+| Day 1 | xbar + ema + deltas/ratios | ✅ **완료** (devlog #010) |
+| Day 2 | LEFT JOIN + Window JOIN (wj) | ✅ **완료** (devlog #010) |
+| Day 3 | 병렬 쿼리 실행 (LocalQueryScheduler) | ✅ **완료** (devlog #011) |
+| Day 4 | 통합 테스트 + 벤치마크 | ✅ **완료** (151개 테스트 PASS) |
+| Day 5 | 문서 업데이트 | ✅ **완료** (2026-03-22) |
+
+**결과:** kdb+ 대체율 **평균 93%** 달성 (HFT 95%, 퀀트 90%, 리스크 95%)

@@ -286,6 +286,50 @@ if(APEX_USE_UCX AND UCX_FOUND)
     target_link_libraries(apex_cluster PUBLIC PkgConfig::UCX)
 endif()
 
+# --- Migration Toolkit (kdb+, ClickHouse, DuckDB, TimescaleDB) ---
+add_library(apex_migration STATIC
+    src/migration/q_lexer.cpp
+    src/migration/q_parser.cpp
+    src/migration/q_to_sql.cpp
+    src/migration/hdb_loader.cpp
+    src/migration/clickhouse_migrator.cpp
+    src/migration/duckdb_interop.cpp
+    src/migration/timescaledb_migrator.cpp
+)
+target_include_directories(apex_migration PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(apex_migration PUBLIC
+    apex_common
+)
+
+# --- Feed Handler Adapters ---
+add_library(apex_feeds STATIC
+    src/feeds/fix_parser.cpp
+    src/feeds/nasdaq_itch.cpp
+)
+target_include_directories(apex_feeds PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(apex_feeds PUBLIC
+    apex_common
+)
+
+# ============================================================================
+# Tools
+# ============================================================================
+add_executable(apex-migrate
+    tools/apex-migrate.cpp
+)
+target_include_directories(apex-migrate PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(apex-migrate PRIVATE
+    apex_migration
+    apex_common
+)
+target_compile_options(apex-migrate PRIVATE -O2)
+
 # ============================================================================
 # Tests
 # ============================================================================

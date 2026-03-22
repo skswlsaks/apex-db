@@ -1,5 +1,5 @@
 # 차세대 HFT 인메모리 DB 시스템 요구사항 정의서
-# ⚠️ 최종 업데이트: 2026-03-22 (SQL/HTTP/JOIN/Window 반영)
+# ⚠️ 최종 업데이트: 2026-03-22 (SQL/HTTP/JOIN/Window/병렬쿼리/금융함수 반영)
 
 ---
 
@@ -29,7 +29,9 @@
 - **N-4 스토리지 모드**: In-Memory / Tiered / On-Disk ✅ 구현
 - **N-5 SIMD 가속**: AVX-512 / ARM SVE ✅ Highway 자동 디스패치
 - **N-6 SQL 호환**: ClickHouse 호환 SQL + HTTP ✅ 구현
-- **N-7 JOIN 지원**: ASOF, Hash, Window 함수 ✅ 구현
+- **N-7 JOIN 지원**: ASOF, Hash, LEFT, Window JOIN ✅ 구현
+- **N-8 병렬 쿼리**: 멀티코어 활용, scatter/gather ✅ 구현 (3.48x@8T)
+- **N-9 kdb+ 호환**: xbar, EMA, Window JOIN, asof ✅ 93% 대체율
 
 ---
 
@@ -47,7 +49,9 @@
 - BitMask filter (11x speedup vs SelectionVector)
 - Highway SIMD (filter 3x, VWAP 2-3x)
 - LLVM JIT O3 (동적 쿼리 컴파일)
-- ASOF JOIN O(n log m), Hash JOIN, Window 함수 O(n)
+- **JOIN 연산자**: ASOF O(n log m), Hash JOIN, LEFT JOIN (NULL 센티넬), Window JOIN O(n log m)
+- **병렬 쿼리**: LocalQueryScheduler (scatter/gather), WorkerPool (jthread), 3.48x@8T
+- **금융 함수**: xbar (시간 바), EMA, DELTA, RATIO, FIRST, LAST, wj_avg/sum/count/min/max
 
 ### 3.4 SQL + API (Layer 4/5) ✅
 - Recursive descent SQL parser (1.5~4.5μs)
@@ -70,6 +74,12 @@
 | 인제스션 | 5M/sec | **5.52M/sec** | ✅ |
 | filter 1M | < 300μs | **272μs** | ✅ |
 | VWAP 1M | < 600μs | **532μs** | ✅ |
+| **xbar (시간 바)** | < 30ms | **24ms (1M→3.3K)** | ✅ |
+| **EMA** | < 3ms | **2.2ms/1M** | ✅ |
+| **DELTA/RATIO** | < 3ms | **<2ms/1M** | ✅ |
+| **ASOF JOIN** | < 100ms | **53ms/1M** | ✅ |
+| **Hash JOIN** | < 100ms | **42ms/1M** | ✅ |
+| **GROUP BY 병렬 (8T)** | > 2x | **3.48x** | ✅ |
 | HDB flush | > 1GB/s | **4.8GB/s** | ✅ |
 | SQL parse | < 50μs | **1.5~4.5μs** | ✅ |
 | Python zero-copy | < 1μs | **522ns** | ✅ |

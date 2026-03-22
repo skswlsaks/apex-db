@@ -33,3 +33,54 @@ target_link_libraries(apex_tests PRIVATE
 include(GoogleTest)
 gtest_discover_tests(apex_tests)
 
+# --- Feed Handler Tests ---
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/feeds/test_fix_parser.cpp")
+    add_executable(test_feeds
+        feeds/test_fix_parser.cpp
+        feeds/test_nasdaq_itch.cpp
+    )
+    target_include_directories(test_feeds PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_feeds PRIVATE
+        apex_feeds
+        apex_common
+        GTest::gtest_main
+    )
+    gtest_discover_tests(test_feeds)
+endif()
+
+# --- Feed Handler Benchmarks ---
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/feeds/benchmark_feed_handlers.cpp")
+    add_executable(bench_feeds
+        feeds/benchmark_feed_handlers.cpp
+    )
+    target_include_directories(bench_feeds PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(bench_feeds PRIVATE
+        apex_feeds
+        apex_common
+        GTest::gtest_main
+    )
+    target_compile_options(bench_feeds PRIVATE -O3 -march=native)
+endif()
+
+# --- Migration Tests ---
+add_executable(test_migration
+    migration/test_q_to_sql.cpp
+    migration/test_hdb_loader.cpp
+    migration/test_clickhouse.cpp
+    migration/test_duckdb.cpp
+    migration/test_timescaledb.cpp
+)
+target_include_directories(test_migration PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(test_migration PRIVATE
+    apex_migration
+    apex_common
+    GTest::gtest_main
+)
+gtest_discover_tests(test_migration)
+

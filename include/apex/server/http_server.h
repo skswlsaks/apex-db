@@ -7,8 +7,11 @@
 //
 // Endpoints:
 //   POST /        — SQL 쿼리 실행 (body: SQL 문자열)
-//   GET  /ping    — 헬스체크
+//   GET  /ping    — 헬스체크 (ClickHouse 호환)
+//   GET  /health  — Kubernetes liveness probe
+//   GET  /ready   — Kubernetes readiness probe
 //   GET  /stats   — 파이프라인 통계
+//   GET  /metrics — Prometheus 메트릭 (OpenMetrics 형식)
 // ============================================================================
 
 #include "apex/sql/executor.h"
@@ -51,6 +54,9 @@ public:
     /// 실행 중 여부
     bool running() const { return running_.load(); }
 
+    /// Readiness 상태 설정 (초기화 완료 후 true로)
+    void set_ready(bool ready) { ready_.store(ready); }
+
 private:
     // 라우트 등록
     void setup_routes();
@@ -62,12 +68,14 @@ private:
     static std::string build_error_json(const std::string& msg);
     static std::string build_stats_json(
         const apex::core::PipelineStats& stats);
+    std::string build_prometheus_metrics() const;
 
     apex::sql::QueryExecutor& executor_;
     uint16_t                  port_;
     std::unique_ptr<httplib::Server> svr_;
     std::thread               thread_;
     std::atomic<bool>         running_{false};
+    std::atomic<bool>         ready_{false};  // Kubernetes readiness
 };
 
 } // namespace apex::server

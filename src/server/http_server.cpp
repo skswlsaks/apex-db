@@ -35,10 +35,40 @@ HttpServer::~HttpServer() {
 // 라우트 설정
 // ============================================================================
 void HttpServer::setup_routes() {
-    // ========== GET /ping — 헬스체크 ==========
+    // ========== GET /ping — 헬스체크 (ClickHouse 호환) ==========
     svr_->Get("/ping", [](const httplib::Request& /*req*/,
                            httplib::Response& res) {
         res.set_content("Ok\n", "text/plain");
+    });
+
+    // ========== GET /health — Kubernetes liveness probe ==========
+    svr_->Get("/health", [this](const httplib::Request& /*req*/,
+                                 httplib::Response& res) {
+        // 서버가 실행 중이면 healthy
+        if (running_.load()) {
+            res.set_content(R"({"status":"healthy"})", "application/json");
+        } else {
+            res.status = 503;
+            res.set_content(R"({"status":"unhealthy"})", "application/json");
+        }
+    });
+
+    // ========== GET /ready — Kubernetes readiness probe ==========
+    svr_->Get("/ready", [this](const httplib::Request& /*req*/,
+                                httplib::Response& res) {
+        // 초기화 완료 + 쿼리 실행 가능 상태
+        if (ready_.load()) {
+            res.set_content(R"({"status":"ready"})", "application/json");
+        } else {
+            res.status = 503;
+            res.set_content(R"({"status":"not_ready"})", "application/json");
+        }
+    });
+
+    // ========== GET /metrics — Prometheus 메트릭 ==========
+    svr_->Get("/metrics", [this](const httplib::Request& /*req*/,
+                                  httplib::Response& res) {
+        res.set_content(build_prometheus_metrics(), "text/plain; version=0.0.4");
     });
 
     // ========== GET /stats — 파이프라인 통계 ==========
@@ -192,6 +222,47 @@ std::string HttpServer::build_stats_json(
        << "\"queries_executed\":" << stats.queries_executed.load() << ","
        << "\"total_rows_scanned\":" << stats.total_rows_scanned.load()
        << "}";
+    return os.str();
+}
+
+// ============================================================================
+// Prometheus 메트릭 (OpenMetrics 형식)
+// ============================================================================
+std::string HttpServer::build_prometheus_metrics() const {
+    auto stats = executor_.stats();
+    std::ostringstream os;
+
+    // HELP & TYPE 메타데이터
+    os << "# HELP apex_ticks_ingested_total Total number of ticks ingested\n";
+    os << "# TYPE apex_ticks_ingested_total counter\n";
+    os << "apex_ticks_ingested_total " << stats.ticks_ingested.load() << "\n\n";
+
+    os << "# HELP apex_ticks_stored_total Total number of ticks stored\n";
+    os << "# TYPE apex_ticks_stored_total counter\n";
+    os << "apex_ticks_stored_total " << stats.ticks_stored.load() << "\n\n";
+
+    os << "# HELP apex_ticks_dropped_total Total number of ticks dropped\n";
+    os << "# TYPE apex_ticks_dropped_total counter\n";
+    os << "apex_ticks_dropped_total " << stats.ticks_dropped.load() << "\n\n";
+
+    os << "# HELP apex_queries_executed_total Total number of queries executed\n";
+    os << "# TYPE apex_queries_executed_total counter\n";
+    os << "apex_queries_executed_total " << stats.queries_executed.load() << "\n\n";
+
+    os << "# HELP apex_rows_scanned_total Total number of rows scanned\n";
+    os << "# TYPE apex_rows_scanned_total counter\n";
+    os << "apex_rows_scanned_total " << stats.total_rows_scanned.load() << "\n\n";
+
+    // Server uptime (running 상태)
+    os << "# HELP apex_server_up Server is up and running\n";
+    os << "# TYPE apex_server_up gauge\n";
+    os << "apex_server_up " << (running_.load() ? "1" : "0") << "\n\n";
+
+    // Readiness
+    os << "# HELP apex_server_ready Server is ready to accept queries\n";
+    os << "# TYPE apex_server_ready gauge\n";
+    os << "apex_server_ready " << (ready_.load() ? "1" : "0") << "\n";
+
     return os.str();
 }
 
