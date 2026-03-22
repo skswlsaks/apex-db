@@ -151,6 +151,11 @@
       - AdTech real-time bidding (10 customers × $100K = $1M)
       - Regulated on-premises industry (5 customers × $200K = $1M)
     - **Business value:** Complementary strategy, solving Snowflake customers' real-time pain
+- [x] **AI-driven bare-metal tuner** ✅ Completed (2026-03-22, devlog #015)
+  - `scripts/ai_tune_bare_metal.py` — Claude Opus 4.6 + extended thinking iterative tuner
+  - Applied: hugepages (4608×2MB=9GB), watchdog off, vm.stat_interval=120, C-states disabled
+  - Build: GCC LTO + PGO + tcmalloc_minimal → Xbar 45.2ms → 43.7ms (-3.3%)
+  - New CMake options: `APEX_USE_TCMALLOC=ON`, `APEX_USE_LTO=ON`
 - [ ] **Bare-metal tuning detailed guide** — CPU pinning, NUMA, io_uring
 - [ ] **Kubernetes operations guide** — Helm, monitoring, troubleshooting
 - [ ] **Website & documentation site** — apex-db.io, docs.apex-db.io
@@ -169,7 +174,8 @@
 - [ ] **JIT SIMD emit** — Generate AVX2/512 vector IR from LLVM JIT
 - [ ] **Multi-threaded drain** — Sharded drain threads
 - [ ] **Ring Buffer dynamic adjustment** — Direct-to-storage path
-- [ ] **HugePages tuning** — Automation
+- [x] **HugePages tuning** ✅ Completed (2026-03-22) — 4608×2MB allocated, active during benchmarks
+- [ ] **exec_group_agg single-column optimization** — Replace `vector<int64_t>` key with flat `int64_t` for single-column GROUP BY (expected 2-5x speedup on Xbar)
 - [ ] **Resource isolation** — realtime (cores 0-3) vs analytics (cores 4-7) CPU pinning
 
 ## Storage & Format Extensions
@@ -247,7 +253,11 @@
   - 5 new tests: push/retrieve, last(N), capacity eviction, clear, AuthManager integration
 
 ## SQL Completeness
-- [ ] **Subquery / CTE (WITH clause)** — `WITH daily AS (...) SELECT ...`
+- [x] **Subquery / CTE (WITH clause)** ✅ Completed (2026-03-22)
+  - `WITH name AS (SELECT ...) [, name2 AS (...)] SELECT ... FROM name`
+  - `SELECT ... FROM (SELECT ...) AS alias` (FROM-subquery)
+  - Chained CTEs (B references A), CTE + UNION ALL, full virtual-table engine
+  - 16 new tests: tokenizer, parser AST, executor (WHERE/GROUP BY/ORDER BY/LIMIT/HAVING over virtual rows)
 - [x] **CASE WHEN** ✅ Completed (2026-03-22)
   - `CASE WHEN cond THEN val [...] ELSE val END AS alias`
   - `CaseWhenExpr` / `CaseWhenBranch` AST nodes; `eval_case_when()` in executor

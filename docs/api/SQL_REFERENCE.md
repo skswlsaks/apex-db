@@ -1,6 +1,7 @@
 # APEX-DB SQL Reference
 
 *Last updated: 2026-03-22*
+*SQL completeness: Phase 1–3 + CTE/Subquery complete*
 
 APEX-DB uses a recursive descent SQL parser with nanosecond timestamp semantics.
 All integer columns are `int64`. Floating-point values are stored as fixed-point scaled integers.
@@ -11,6 +12,7 @@ All integer columns are `int64`. Floating-point values are stored as fixed-point
 ## Table of Contents
 
 - [SELECT Syntax](#select-syntax)
+- [CTE (WITH clause) & Subqueries](#cte-with-clause--subqueries)
 - [WHERE Conditions](#where-conditions)
 - [Aggregate Functions](#aggregate-functions)
 - [GROUP BY / HAVING / ORDER BY / LIMIT](#group-by--having--order-by--limit)
@@ -21,6 +23,7 @@ All integer columns are `int64`. Floating-point values are stored as fixed-point
 - [Set Operations](#set-operations)
 - [CASE WHEN](#case-when)
 - [Data Types & Timestamp Arithmetic](#data-types--timestamp-arithmetic)
+- [Known Limitations](#known-limitations)
 
 ---
 
@@ -105,13 +108,47 @@ SELECT symbol, price, volume FROM trades WHERE symbol = 2
 ORDER BY symbol ASC, timestamp ASC
 ```
 
+### 8. CTE — multi-step aggregation
+
+```sql
+-- Step 1: per-minute VWAP bar
+-- Step 2: rank bars by volume
+WITH bars AS (
+    SELECT DATE_TRUNC('min', timestamp) AS minute,
+           VWAP(price, volume)           AS vwap,
+           SUM(volume)                   AS vol
+    FROM trades
+    WHERE symbol = 1
+    GROUP BY DATE_TRUNC('min', timestamp)
+)
+SELECT minute, vwap, vol
+FROM bars
+WHERE vol > 50000
+ORDER BY vol DESC
+LIMIT 10
+```
+
+### 9. FROM subquery — derived table
+
+```sql
+SELECT symbol, avg_price
+FROM (
+    SELECT symbol,
+           AVG(price) AS avg_price
+    FROM trades
+    GROUP BY symbol
+) AS summary
+WHERE avg_price > 15000
+```
+
 ---
 
 ## SELECT Syntax
 
 ```
+[WITH cte_name AS (SELECT ...) [, cte_name2 AS (SELECT ...) ...]]
 SELECT [DISTINCT] col_expr [AS alias], ...
-FROM table_name [AS alias]
+FROM { table_name [AS alias] | (SELECT ...) AS alias }
   [JOIN ...]
 WHERE condition
 GROUP BY col_or_expr, ...
@@ -147,6 +184,107 @@ SELECT DISTINCT symbol FROM trades
 ```sql
 SELECT t.price, q.bid FROM trades t ASOF JOIN quotes q ...
 ```
+
+---
+
+## CTE (WITH clause) & Subqueries
+
+### WITH clause (Common Table Expressions)
+
+Named temporary result sets defined before the main SELECT. Makes complex multi-step queries readable and avoids nesting.
+
+```
+WITH name AS (SELECT ...) [, name2 AS (SELECT ...) ...]
+SELECT ... FROM name
+```
+
+```sql
+-- Single CTE
+WITH daily AS (
+    SELECT symbol,
+           DATE_TRUNC('day', timestamp) AS day,
+           SUM(volume)                  AS vol
+    FROM trades
+    GROUP BY symbol, DATE_TRUNC('day', timestamp)
+)
+SELECT symbol, SUM(vol) AS total_vol
+FROM daily
+GROUP BY symbol
+ORDER BY total_vol DESC
+```
+
+```sql
+-- Multiple chained CTEs (b references a)
+WITH a AS (
+    SELECT symbol, SUM(volume) AS total
+    FROM trades
+    GROUP BY symbol
+),
+b AS (
+    SELECT symbol, total
+    FROM a
+    WHERE total > 1000
+)
+SELECT symbol, total FROM b ORDER BY total DESC
+```
+
+```sql
+-- CTE + UNION ALL
+WITH highs AS (
+    SELECT symbol, price FROM trades WHERE price > 15050
+)
+SELECT symbol, price FROM highs
+UNION ALL
+SELECT symbol, price FROM trades WHERE symbol = 2
+```
+
+### FROM subquery (derived table)
+
+Use a SELECT as the FROM source by wrapping it in parentheses with an alias.
+
+```sql
+SELECT symbol, avg_price
+FROM (
+    SELECT symbol, AVG(price) AS avg_price
+    FROM trades
+    GROUP BY symbol
+) AS summary
+WHERE avg_price > 15000
+ORDER BY avg_price DESC
+```
+
+```sql
+-- Aggregation over subquery
+SELECT SUM(vol) AS grand_total
+FROM (
+    SELECT symbol, SUM(volume) AS vol
+    FROM trades
+    WHERE price > 15000
+    GROUP BY symbol
+) AS sub
+```
+
+### Supported clauses on virtual tables
+
+All standard clauses work on CTE / subquery results:
+
+| Clause | Supported |
+|--------|-----------|
+| `WHERE` | ✅ All operators (=, !=, >, <, BETWEEN, IN, IS NULL, LIKE, AND, OR, NOT) |
+| `GROUP BY` | ✅ Single and multi-column |
+| `HAVING` | ✅ Post-aggregation filter |
+| `ORDER BY` | ✅ Single and multi-column, ASC/DESC |
+| `LIMIT` | ✅ |
+| `DISTINCT` | ✅ |
+| `SELECT *` | ✅ Pass-through all source columns |
+| Arithmetic | ✅ `price * volume AS notional` |
+| Aggregates | ✅ SUM, AVG, MIN, MAX, COUNT, FIRST, LAST |
+
+### Limitations
+
+- No correlated subqueries (`WHERE col = (SELECT ...)`)
+- No subqueries inside SELECT expressions or WHERE conditions
+- VWAP, XBAR, window functions, and JOIN not yet supported on virtual tables
 
 ---
 
@@ -613,6 +751,22 @@ Unit reference:
 | 1 min | `60_000_000_000` |
 | 1 hour | `3_600_000_000_000` |
 | 1 day | `86_400_000_000_000` |
+
+---
+
+## Known Limitations
+
+Features not yet implemented (planned):
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `RIGHT JOIN` / `FULL OUTER JOIN` | Planned | LEFT JOIN + INNER JOIN available |
+| `EXPLAIN` | Planned | Query execution plan output |
+| `SUBSTR(col, start, len)` | Planned | String extraction for symbol names |
+| NULL standardization | Planned | INT64_MIN sentinel → proper SQL NULL semantics |
+| Correlated subqueries | Not planned | `WHERE col = (SELECT ...)` |
+| Subqueries in SELECT/WHERE | Not planned | Only FROM position supported |
+| JOINs on virtual tables | Planned | CTE/subquery as JOIN source |
 
 ---
 
