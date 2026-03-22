@@ -34,6 +34,9 @@ enum class AggFunc {
     MIN,
     MAX,
     VWAP,   // VWAP(price, volume) — 금융 특화
+    FIRST,  // FIRST(col) — kdb+ first(): 그룹의 첫 번째 값 (OHLC용 OPEN)
+    LAST,   // LAST(col)  — kdb+ last():  그룹의 마지막 값 (OHLC용 CLOSE)
+    XBAR,   // XBAR(col, bucket) — 시간 버킷 플로어 (GROUP BY 키로도 사용)
 };
 
 // ============================================================================
@@ -50,6 +53,9 @@ enum class WindowFunc {
     MAX,
     LAG,
     LEAD,
+    EMA,    // EMA(col, alpha_or_period) — 지수이동평균
+    DELTA,  // DELTA(col) — 행간 차이 (x[i] - x[i-1])
+    RATIO,  // RATIO(col) — 행간 비율 (x[i] / x[i-1])
 };
 
 // ============================================================================
@@ -74,6 +80,18 @@ struct WindowSpec {
 };
 
 // ============================================================================
+// WJAggFunc: WINDOW JOIN 내에서 사용되는 집계 함수
+// ============================================================================
+enum class WJAggFunc {
+    NONE,
+    AVG,
+    SUM,
+    COUNT,
+    MIN,
+    MAX,
+};
+
+// ============================================================================
 // SelectExpr: SELECT 목록의 단일 항목
 // ============================================================================
 struct SelectExpr {
@@ -84,10 +102,18 @@ struct SelectExpr {
     std::string alias;         // AS alias
     bool        is_star = false; // SELECT *
 
+    // XBAR: xbar(col, bucket_size) — 두 번째 인자 (버킷 크기)
+    int64_t     xbar_bucket = 0;
+
+    // WINDOW JOIN 집계: wj_avg(q.col) 등
+    WJAggFunc   wj_agg = WJAggFunc::NONE;
+
     // 윈도우 함수 (OVER 절이 있으면 window_func != NONE)
     WindowFunc  window_func    = WindowFunc::NONE;
     int64_t     window_offset  = 1;     // LAG/LEAD offset
     int64_t     window_default = 0;     // LAG/LEAD default value
+    double      ema_alpha      = 0.0;   // EMA alpha 파라미터 (0이면 period 기반)
+    int64_t     ema_period     = 0;     // EMA period (alpha = 2/(period+1))
     std::optional<WindowSpec> window_spec;  // OVER (...)
 };
 
@@ -149,12 +175,20 @@ struct JoinCondition {
 // JoinClause
 // ============================================================================
 struct JoinClause {
-    enum class Type { INNER, ASOF, LEFT };
+    enum class Type { INNER, ASOF, LEFT, WINDOW };
 
     Type                        type = Type::INNER;
     std::string                 table;
     std::string                 alias;
     std::vector<JoinCondition>  on_conditions;
+
+    // WINDOW JOIN 전용: 시간 윈도우 집계
+    // SELECT wj_avg(q.bid) AS avg_bid — SELECT 목록에서 wj_ 집계로 처리
+    // ON t.symbol = q.symbol AND q.timestamp BETWEEN t.ts - W AND t.ts + W
+    std::string  wj_left_time_col;    // 왼쪽 타임스탬프 컬럼 (예: timestamp)
+    std::string  wj_right_time_col;   // 오른쪽 타임스탬프 컬럼
+    int64_t      wj_window_before = 0; // 윈도우 크기: t.ts - wj_window_before
+    int64_t      wj_window_after  = 0; // 윈도우 크기: t.ts + wj_window_after
 };
 
 // ============================================================================
@@ -163,6 +197,8 @@ struct JoinClause {
 struct GroupByClause {
     std::vector<std::string> columns;  // table_alias.col 또는 col
     std::vector<std::string> aliases;  // 대응되는 테이블 alias (없으면 "")
+    // XBAR: GROUP BY xbar(col, bucket) 지원
+    std::vector<int64_t>     xbar_buckets;  // 0이면 일반 컬럼, >0이면 xbar
 };
 
 // ============================================================================

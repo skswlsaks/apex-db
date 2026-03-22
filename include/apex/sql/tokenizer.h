@@ -45,6 +45,13 @@ enum class TokenType {
     LAG,            // LAG()
     LEAD,           // LEAD()
 
+    // 금융 함수 키워드 (kdb+ 스타일)
+    XBAR,       // XBAR(col, bucket) — 시간 바 집계
+    EMA,        // EMA(col, alpha) OVER (...) — 지수이동평균
+    DELTA,      // DELTA(col) OVER (...) — 행간 차이
+    RATIO,      // RATIO(col) OVER (...) — 행간 비율
+    WINDOW,     // WINDOW JOIN 에 사용
+
     // 비교 연산자
     GT,   // >
     LT,   // <
@@ -52,6 +59,10 @@ enum class TokenType {
     LE,   // <=
     EQ,   // =
     NE,   // != or <>
+
+    // 산술 연산자
+    PLUS,     // +
+    MINUS,    // - (이항)
 
     // 구분자/특수문자
     COMMA,    // ,

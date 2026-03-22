@@ -87,6 +87,12 @@ QueryResultSet QueryExecutor::exec_select(const SelectStmt& stmt) {
             return exec_hash_join(stmt, left_parts, right_parts);
         }
 
+        // WINDOW JOIN (kdb+ wj 스타일)
+        if (stmt.join.has_value() && stmt.join->type == JoinClause::Type::WINDOW) {
+            auto right_parts = find_partitions(stmt.join->table);
+            return exec_window_join(stmt, left_parts, right_parts);
+        }
+
         bool has_agg = false;
         for (const auto& col : stmt.columns) {
             if (col.agg != AggFunc::NONE) { has_agg = true; break; }
@@ -120,6 +126,12 @@ QueryResultSet QueryExecutor::exec_select(const SelectStmt& stmt) {
                                || stmt.join->type == JoinClause::Type::LEFT)) {
         auto right_parts = find_partitions(stmt.join->table);
         return exec_hash_join(stmt, left_parts, right_parts);
+    }
+
+    // WINDOW JOIN (kdb+ wj 스타일)
+    if (stmt.join.has_value() && stmt.join->type == JoinClause::Type::WINDOW) {
+        auto right_parts = find_partitions(stmt.join->table);
+        return exec_window_join(stmt, left_parts, right_parts);
     }
 
     // 집계 함수가 있는지 체크
@@ -489,6 +501,9 @@ QueryResultSet QueryExecutor::exec_agg(
     std::vector<int64_t>  maxv(stmt.columns.size(), INT64_MIN);
     std::vector<double>   vwap_pv(stmt.columns.size(), 0.0);
     std::vector<int64_t>  vwap_v(stmt.columns.size(), 0);
+    std::vector<int64_t>  first_val(stmt.columns.size(), 0);
+    std::vector<int64_t>  last_val(stmt.columns.size(), 0);
+    std::vector<bool>     has_first(stmt.columns.size(), false);
 
     // 타임스탬프 이진탐색 최적화
     int64_t ts_lo = INT64_MIN, ts_hi = INT64_MAX;
@@ -541,6 +556,37 @@ QueryResultSet QueryExecutor::exec_agg(
                             maxv[ci] = std::max(maxv[ci], data[idx]);
                     }
                     break;
+                case AggFunc::FIRST:
+                    if (data) {
+                        for (auto idx : sel_indices) {
+                            if (!has_first[ci]) {
+                                first_val[ci] = data[idx];
+                                has_first[ci] = true;
+                            }
+                            last_val[ci] = data[idx];
+                        }
+                    }
+                    break;
+                case AggFunc::LAST:
+                    if (data) {
+                        for (auto idx : sel_indices) {
+                            if (!has_first[ci]) {
+                                first_val[ci] = data[idx];
+                                has_first[ci] = true;
+                            }
+                            last_val[ci] = data[idx];
+                        }
+                    }
+                    break;
+                case AggFunc::XBAR:
+                    // GROUP BY 없이 XBAR SELECT — 단순히 첫 번째 값 반환
+                    if (data && !sel_indices.empty() && !has_first[ci]) {
+                        int64_t b = col.xbar_bucket;
+                        int64_t v = data[sel_indices[0]];
+                        first_val[ci] = b > 0 ? (v / b) * b : v;
+                        has_first[ci] = true;
+                    }
+                    break;
                 case AggFunc::VWAP: {
                     const int64_t* vdata = get_col_data(*part, col.agg_arg2);
                     if (data && vdata) {
@@ -587,6 +633,9 @@ QueryResultSet QueryExecutor::exec_agg(
                     ? static_cast<int64_t>(vwap_pv[ci] / vwap_v[ci])
                     : 0;
                 break;
+            case AggFunc::FIRST: row[ci] = first_val[ci]; break;
+            case AggFunc::LAST:  row[ci] = last_val[ci];  break;
+            case AggFunc::XBAR:  row[ci] = first_val[ci]; break;
             case AggFunc::NONE: row[ci] = 0; break;
         }
     }
@@ -614,7 +663,9 @@ QueryResultSet QueryExecutor::exec_group_agg(
 
     const auto& gb = stmt.group_by.value();
     const std::string& group_col = gb.columns[0];
-    bool is_symbol_group = (group_col == "symbol");
+    // xbar 버킷 크기 (0이면 일반 컬럼, >0이면 xbar 플로어)
+    int64_t group_xbar_bucket = gb.xbar_buckets.empty() ? 0 : gb.xbar_buckets[0];
+    bool is_symbol_group = (group_col == "symbol" && group_xbar_bucket == 0);
 
     struct GroupState {
         int64_t  sum     = 0;
@@ -624,6 +675,9 @@ QueryResultSet QueryExecutor::exec_group_agg(
         int64_t  maxv    = INT64_MIN;
         double   vwap_pv = 0.0;
         int64_t  vwap_v  = 0;
+        int64_t  first_val = 0;      // FIRST() 집계
+        int64_t  last_val  = 0;      // LAST() 집계
+        bool     has_first = false;  // 첫 값 기록 여부
     };
 
     // 타임스탬프 범위 이진탐색 최적화
@@ -666,6 +720,9 @@ QueryResultSet QueryExecutor::exec_group_agg(
                 for (size_t ci = 0; ci < stmt.columns.size(); ++ci) {
                     const auto& col = stmt.columns[ci];
                     auto& gs = states[ci];
+                    if (col.agg == AggFunc::NONE && col.agg != AggFunc::XBAR) {
+                        if (col.agg == AggFunc::NONE) continue;
+                    }
                     if (col.agg == AggFunc::NONE) continue;
                     const int64_t* data = get_col_data(*part, col.column);
                     switch (col.agg) {
@@ -678,6 +735,33 @@ QueryResultSet QueryExecutor::exec_group_agg(
                             if (data) gs.minv = std::min(gs.minv, data[idx]); break;
                         case AggFunc::MAX:
                             if (data) gs.maxv = std::max(gs.maxv, data[idx]); break;
+                        case AggFunc::FIRST:
+                            if (data && !gs.has_first) {
+                                gs.first_val = data[idx];
+                                gs.has_first = true;
+                            }
+                            gs.last_val = data ? data[idx] : 0; // LAST도 업데이트
+                            break;
+                        case AggFunc::LAST:
+                            if (data) {
+                                if (!gs.has_first) {
+                                    gs.first_val = data[idx];
+                                    gs.has_first = true;
+                                }
+                                gs.last_val = data[idx]; // 항상 마지막 값
+                            }
+                            break;
+                        case AggFunc::XBAR:
+                            // XBAR는 GROUP BY 키 계산에 쓰임, SELECT에서도 쓸 수 있음
+                            // SELECT xbar(timestamp, bucket) → 해당 버킷 플로어 값
+                            if (data && !gs.has_first) {
+                                int64_t bucket = col.xbar_bucket;
+                                gs.first_val = bucket > 0
+                                    ? (data[idx] / bucket) * bucket
+                                    : data[idx];
+                                gs.has_first = true;
+                            }
+                            break;
                         case AggFunc::VWAP: {
                             const int64_t* vd = get_col_data(*part, col.agg_arg2);
                             if (data && vd) {
@@ -725,6 +809,9 @@ QueryResultSet QueryExecutor::exec_group_agg(
                     case AggFunc::VWAP:
                         row.push_back(gs.vwap_v > 0
                             ? static_cast<int64_t>(gs.vwap_pv / gs.vwap_v) : 0); break;
+                    case AggFunc::FIRST: row.push_back(gs.first_val); break;
+                    case AggFunc::LAST:  row.push_back(gs.last_val);  break;
+                    case AggFunc::XBAR:  row.push_back(gs.first_val); break;
                     case AggFunc::NONE: break;
                 }
             }
@@ -767,7 +854,11 @@ QueryResultSet QueryExecutor::exec_group_agg(
         if (!gdata) continue;
 
         for (auto idx : sel_indices) {
+            // xbar가 있으면 group key = (gdata[idx] / bucket) * bucket
             int64_t gkey = gdata[idx];
+            if (group_xbar_bucket > 0) {
+                gkey = (gkey / group_xbar_bucket) * group_xbar_bucket;
+            }
             auto& states = groups[gkey];
             if (states.empty()) states.resize(stmt.columns.size());
 
@@ -786,6 +877,26 @@ QueryResultSet QueryExecutor::exec_group_agg(
                         if (data) gs.minv = std::min(gs.minv, data[idx]); break;
                     case AggFunc::MAX:
                         if (data) gs.maxv = std::max(gs.maxv, data[idx]); break;
+                    case AggFunc::FIRST:
+                        if (data && !gs.has_first) {
+                            gs.first_val = data[idx];
+                            gs.has_first = true;
+                        }
+                        if (data) gs.last_val = data[idx];
+                        break;
+                    case AggFunc::LAST:
+                        if (data) {
+                            if (!gs.has_first) { gs.first_val = data[idx]; gs.has_first = true; }
+                            gs.last_val = data[idx];
+                        }
+                        break;
+                    case AggFunc::XBAR:
+                        if (data && !gs.has_first) {
+                            int64_t b = col.xbar_bucket;
+                            gs.first_val = b > 0 ? (data[idx] / b) * b : data[idx];
+                            gs.has_first = true;
+                        }
+                        break;
                     case AggFunc::VWAP: {
                         const int64_t* vd = get_col_data(*part, col.agg_arg2);
                         if (data && vd) {
@@ -837,6 +948,9 @@ QueryResultSet QueryExecutor::exec_group_agg(
                     row.push_back(gs.vwap_v > 0
                         ? static_cast<int64_t>(gs.vwap_pv / gs.vwap_v) : 0);
                     break;
+                case AggFunc::FIRST: row.push_back(gs.first_val); break;
+                case AggFunc::LAST:  row.push_back(gs.last_val);  break;
+                case AggFunc::XBAR:  row.push_back(gs.first_val); break;
                 case AggFunc::NONE: break;
             }
         }
@@ -1020,8 +1134,6 @@ QueryResultSet QueryExecutor::exec_hash_join(
 
     // ── HashJoinOperator 사용: Arena 없이 ColumnVector가 필요하므로
     //    직접 unordered_map 방식으로 처리 ──
-    // (join_operator.h의 HashJoinOperator는 ColumnVector를 받으므로,
-    //  여기서는 std::unordered_map을 직접 사용)
     std::unordered_map<int64_t, std::vector<size_t>> hash_map;
     hash_map.reserve(r_keys_flat.size() * 2);
     for (size_t ri = 0; ri < r_keys_flat.size(); ++ri) {
@@ -1029,10 +1141,21 @@ QueryResultSet QueryExecutor::exec_hash_join(
     }
 
     // 매칭 인덱스 쌍 생성
-    std::vector<size_t> matched_l, matched_r;
+    // LEFT JOIN: 매칭 없는 왼쪽 행은 r_index = SIZE_MAX (NULL 표시)
+    bool is_left_join = (stmt.join->type == JoinClause::Type::LEFT);
+    std::vector<size_t> matched_l;
+    std::vector<size_t> matched_r; // SIZE_MAX = NULL (LEFT JOIN 전용)
+
     for (size_t li = 0; li < l_keys_flat.size(); ++li) {
         auto it = hash_map.find(l_keys_flat[li]);
-        if (it == hash_map.end()) continue;
+        if (it == hash_map.end()) {
+            if (is_left_join) {
+                // LEFT JOIN: 오른쪽 NULL로 포함
+                matched_l.push_back(li);
+                matched_r.push_back(SIZE_MAX); // NULL 센티넬
+            }
+            continue;
+        }
         for (size_t ri : it->second) {
             matched_l.push_back(li);
             matched_r.push_back(ri);
@@ -1061,9 +1184,14 @@ QueryResultSet QueryExecutor::exec_hash_join(
     size_t limit = stmt.limit.value_or(INT64_MAX);
     for (size_t m = 0; m < matched_l.size() && result.rows.size() < limit; ++m) {
         const RowRef& lr = l_refs[matched_l[m]];
-        const RowRef& rr = r_refs[matched_r[m]];
+        bool right_null = (matched_r[m] == SIZE_MAX); // LEFT JOIN에서 오른쪽 없음
         auto* lp = left_parts[lr.part_idx];
-        auto* rp = right_parts[rr.part_idx];
+        Partition* rp = nullptr;
+        RowRef rr{0, 0};
+        if (!right_null) {
+            rr = r_refs[matched_r[m]];
+            rp = right_parts[rr.part_idx];
+        }
 
         std::vector<int64_t> row;
         for (const auto& sel : stmt.columns) {
@@ -1076,8 +1204,12 @@ QueryResultSet QueryExecutor::exec_hash_join(
             }
             bool is_right = (!sel.table_alias.empty() && sel.table_alias == r_alias);
             if (is_right) {
-                const int64_t* d = get_col_data(*rp, sel.column);
-                row.push_back(d ? d[rr.local_idx] : 0);
+                if (right_null || !rp) {
+                    row.push_back(JOIN_NULL); // NULL 센티넬 (INT64_MIN)
+                } else {
+                    const int64_t* d = get_col_data(*rp, sel.column);
+                    row.push_back(d ? d[rr.local_idx] : 0);
+                }
             } else {
                 const int64_t* d = get_col_data(*lp, sel.column);
                 row.push_back(d ? d[lr.local_idx] : 0);
@@ -1179,6 +1311,22 @@ void QueryExecutor::apply_window_functions(
             case WindowFunc::LEAD:
                 wf = std::make_unique<WindowLead>(sel.window_offset, sel.window_default);
                 break;
+            // kdb+ 스타일 금융 윈도우 함수
+            case WindowFunc::EMA: {
+                double alpha = sel.ema_alpha;
+                if (alpha <= 0.0 && sel.ema_period > 0) {
+                    alpha = 2.0 / (sel.ema_period + 1.0);
+                }
+                if (alpha <= 0.0) alpha = 0.1; // 기본값
+                wf = std::make_unique<WindowEMA>(alpha);
+                break;
+            }
+            case WindowFunc::DELTA:
+                wf = std::make_unique<WindowDelta>();
+                break;
+            case WindowFunc::RATIO:
+                wf = std::make_unique<WindowRatio>();
+                break;
             case WindowFunc::NONE:
                 continue;
         }
@@ -1219,6 +1367,155 @@ bool QueryExecutor::has_where_symbol(
         return self(self, expr->left) || self(self, expr->right);
     };
     return find_sym(find_sym, stmt.where->expr);
+}
+
+// ============================================================================
+// WINDOW JOIN 실행 (kdb+ wj 스타일)
+// ============================================================================
+// 각 왼쪽 행에 대해 시간 윈도우 [t-before, t+after] 안의 오른쪽 행 집계
+// SELECT 목록의 wj_agg(r.col) 함수를 처리
+// ============================================================================
+QueryResultSet QueryExecutor::exec_window_join(
+    const SelectStmt& stmt,
+    const std::vector<Partition*>& left_parts,
+    const std::vector<Partition*>& right_parts)
+{
+    QueryResultSet result;
+
+    if (left_parts.empty() || right_parts.empty()) return result;
+
+    const auto& jc = stmt.join.value();
+
+    // ON 조건에서 equi 키 추출
+    std::string l_key_col = "symbol", r_key_col = "symbol";
+    for (const auto& cond : jc.on_conditions) {
+        if (cond.op == CompareOp::EQ) {
+            l_key_col = cond.left_col;
+            r_key_col = cond.right_col;
+            break;
+        }
+    }
+
+    // 타임스탬프 컬럼 이름
+    std::string l_time_col = jc.wj_left_time_col.empty()  ? "timestamp" : jc.wj_left_time_col;
+    std::string r_time_col = jc.wj_right_time_col.empty() ? "timestamp" : jc.wj_right_time_col;
+    int64_t before = jc.wj_window_before;
+    int64_t after  = jc.wj_window_after;
+
+    const std::string r_alias = jc.alias;
+
+    // 왼쪽/오른쪽 데이터를 flat 벡터로 수집
+    struct RowRef { size_t part_idx; size_t local_idx; };
+    std::vector<int64_t> l_key_flat, r_key_flat;
+    std::vector<int64_t> l_time_flat, r_time_flat;
+    std::vector<RowRef> l_refs, r_refs;
+
+    for (size_t pi = 0; pi < left_parts.size(); ++pi) {
+        auto* part = left_parts[pi];
+        const int64_t* kd = get_col_data(*part, l_key_col);
+        const int64_t* td = get_col_data(*part, l_time_col);
+        size_t n = part->num_rows();
+        for (size_t i = 0; i < n; ++i) {
+            l_key_flat.push_back(kd ? kd[i] : 0);
+            l_time_flat.push_back(td ? td[i] : 0);
+            l_refs.push_back({pi, i});
+        }
+    }
+
+    for (size_t pi = 0; pi < right_parts.size(); ++pi) {
+        auto* part = right_parts[pi];
+        const int64_t* kd = get_col_data(*part, r_key_col);
+        const int64_t* td = get_col_data(*part, r_time_col);
+        size_t n = part->num_rows();
+        for (size_t i = 0; i < n; ++i) {
+            r_key_flat.push_back(kd ? kd[i] : 0);
+            r_time_flat.push_back(td ? td[i] : 0);
+            r_refs.push_back({pi, i});
+        }
+    }
+
+    size_t ln = l_key_flat.size();
+    size_t rn = r_key_flat.size();
+
+    // 결과 컬럼 이름 설정 (왼쪽 일반 컬럼 + wj_agg 컬럼)
+    for (const auto& sel : stmt.columns) {
+        if (sel.wj_agg != WJAggFunc::NONE) {
+            std::string name = sel.alias.empty() ? sel.column : sel.alias;
+            result.column_names.push_back(name);
+            result.column_types.push_back(ColumnType::INT64);
+        } else if (!sel.is_star) {
+            std::string name = sel.alias.empty() ? sel.column : sel.alias;
+            result.column_names.push_back(name);
+            result.column_types.push_back(ColumnType::INT64);
+        }
+    }
+
+    // 각 wj_agg 컬럼에 대해 WindowJoinOperator 실행
+    // SELECT에서 wj_agg를 찾아 처리
+    struct WJColInfo {
+        size_t sel_idx;   // stmt.columns 인덱스
+        WJAggType agg_type;
+        std::vector<int64_t> r_val_flat; // 오른쪽 집계 대상 컬럼 데이터
+    };
+    std::vector<WJColInfo> wj_cols;
+
+    for (size_t ci = 0; ci < stmt.columns.size(); ++ci) {
+        const auto& sel = stmt.columns[ci];
+        if (sel.wj_agg == WJAggFunc::NONE) continue;
+
+        WJAggType agg_type;
+        switch (sel.wj_agg) {
+            case WJAggFunc::AVG:   agg_type = WJAggType::AVG;   break;
+            case WJAggFunc::SUM:   agg_type = WJAggType::SUM;   break;
+            case WJAggFunc::COUNT: agg_type = WJAggType::COUNT; break;
+            case WJAggFunc::MIN:   agg_type = WJAggType::MIN;   break;
+            case WJAggFunc::MAX:   agg_type = WJAggType::MAX;   break;
+            default:               agg_type = WJAggType::AVG;   break;
+        }
+
+        // 오른쪽 테이블에서 해당 컬럼 데이터 수집
+        std::vector<int64_t> r_val_flat(rn, 0);
+        for (size_t ri = 0; ri < rn; ++ri) {
+            auto* rp = right_parts[r_refs[ri].part_idx];
+            const int64_t* vd = get_col_data(*rp, sel.column);
+            r_val_flat[ri] = vd ? vd[r_refs[ri].local_idx] : 0;
+        }
+
+        wj_cols.push_back({ci, agg_type, std::move(r_val_flat)});
+    }
+
+    // 각 왼쪽 행에 대해 window join 계산
+    size_t limit = stmt.limit.value_or(SIZE_MAX);
+    for (size_t li = 0; li < ln && result.rows.size() < limit; ++li) {
+        std::vector<int64_t> row;
+
+        // 왼쪽 일반 컬럼 먼저
+        for (const auto& sel : stmt.columns) {
+            if (sel.wj_agg != WJAggFunc::NONE) continue;
+            if (sel.is_star) continue;
+            auto* lp = left_parts[l_refs[li].part_idx];
+            const int64_t* d = get_col_data(*lp, sel.column);
+            row.push_back(d ? d[l_refs[li].local_idx] : 0);
+        }
+
+        // wj_agg 컬럼 계산
+        for (auto& wjc : wj_cols) {
+            WindowJoinOperator wjop(wjc.agg_type, before, after);
+            auto wjres = wjop.execute(
+                l_key_flat.data() + li, 1,  // 단일 왼쪽 행
+                r_key_flat.data(), rn,
+                l_time_flat.data() + li,
+                r_time_flat.data(),
+                wjc.r_val_flat.data()
+            );
+            row.push_back(wjres.agg_values.empty() ? 0 : wjres.agg_values[0]);
+        }
+
+        result.rows.push_back(std::move(row));
+    }
+
+    result.rows_scanned = ln + rn;
+    return result;
 }
 
 

@@ -521,12 +521,145 @@ private:
 };
 
 // ============================================================================
+// WindowEMA: EMA(col, alpha) OVER (PARTITION BY ... ORDER BY ...)
+// kdb+ ema(alpha, data): O(n) 단일 패스 지수이동평균
+//
+// 계산식:
+//   ema[0] = data[0]
+//   ema[i] = alpha * data[i] + (1 - alpha) * ema[i-1]
+//
+// alpha: 0 < alpha < 1 (직접 지정 또는 period 기반: alpha = 2/(period+1))
+// ============================================================================
+class WindowEMA : public WindowFunction {
+public:
+    explicit WindowEMA(double alpha = 0.1)
+        : alpha_(alpha) {}
+
+    void compute(
+        const int64_t* input, size_t n,
+        int64_t* output,
+        const WindowFrame& /*frame*/,
+        const int64_t* partition_keys = nullptr
+    ) override
+    {
+        auto do_ema = [&](size_t start, size_t end) {
+            if (start >= end) return;
+            // ema[0] = data[0]
+            double ema = static_cast<double>(input[start]);
+            output[start] = static_cast<int64_t>(ema);
+            // O(n) 단일 패스
+            for (size_t i = start + 1; i < end; ++i) {
+                ema = alpha_ * static_cast<double>(input[i]) + (1.0 - alpha_) * ema;
+                output[i] = static_cast<int64_t>(ema);
+            }
+        };
+
+        if (!partition_keys) {
+            do_ema(0, n);
+        } else {
+            auto bounds = compute_partition_bounds(partition_keys, n);
+            for (size_t p = 0; p + 1 < bounds.size(); ++p) {
+                do_ema(bounds[p], bounds[p + 1]);
+            }
+        }
+    }
+
+    void set_alpha(double alpha) { alpha_ = alpha; }
+
+private:
+    double alpha_; // 평활 계수 (0 < alpha < 1)
+};
+
+// ============================================================================
+// WindowDelta: DELTA(col) OVER (...) — 행간 차이 (kdb+ deltas)
+//
+// delta[0] = data[0]           (첫 행은 원본 값 그대로)
+// delta[i] = data[i] - data[i-1]
+//
+// 파티션별 독립 처리
+// ============================================================================
+class WindowDelta : public WindowFunction {
+public:
+    void compute(
+        const int64_t* input, size_t n,
+        int64_t* output,
+        const WindowFrame& /*frame*/,
+        const int64_t* partition_keys = nullptr
+    ) override
+    {
+        auto do_delta = [&](size_t start, size_t end) {
+            if (start >= end) return;
+            output[start] = input[start]; // 첫 행: 원본 값
+            for (size_t i = start + 1; i < end; ++i) {
+                output[i] = input[i] - input[i - 1];
+            }
+        };
+
+        if (!partition_keys) {
+            do_delta(0, n);
+        } else {
+            auto bounds = compute_partition_bounds(partition_keys, n);
+            for (size_t p = 0; p + 1 < bounds.size(); ++p) {
+                do_delta(bounds[p], bounds[p + 1]);
+            }
+        }
+    }
+};
+
+// ============================================================================
+// WindowRatio: RATIO(col) OVER (...) — 행간 비율 (kdb+ ratios)
+//
+// ratio[0] = 1 (또는 data[0] — kdb+는 1로 정의)
+// ratio[i] = data[i] / data[i-1]  (분모가 0이면 0 반환)
+//
+// 주의: 정수 스케일 — 소수점 정밀도 손실.
+//       실제 사용 시 1000 곱해서 스케일링 권장 (ratio * 1000 → 0.001 단위)
+// ============================================================================
+class WindowRatio : public WindowFunction {
+public:
+    void compute(
+        const int64_t* input, size_t n,
+        int64_t* output,
+        const WindowFrame& /*frame*/,
+        const int64_t* partition_keys = nullptr
+    ) override
+    {
+        auto do_ratio = [&](size_t start, size_t end) {
+            if (start >= end) return;
+            // 첫 행은 ratio = 1 (기준값)
+            // 스케일: 소수 6자리 (×1_000_000)
+            output[start] = 1'000'000LL;
+            for (size_t i = start + 1; i < end; ++i) {
+                if (input[i - 1] != 0) {
+                    // ratio * 1_000_000 (고정소수점 6자리)
+                    output[i] = static_cast<int64_t>(
+                        (static_cast<double>(input[i]) /
+                         static_cast<double>(input[i - 1])) * 1'000'000.0);
+                } else {
+                    output[i] = 0; // 분모 0: 정의 불가
+                }
+            }
+        };
+
+        if (!partition_keys) {
+            do_ratio(0, n);
+        } else {
+            auto bounds = compute_partition_bounds(partition_keys, n);
+            for (size_t p = 0; p + 1 < bounds.size(); ++p) {
+                do_ratio(bounds[p], bounds[p + 1]);
+            }
+        }
+    }
+};
+
+// ============================================================================
 // WindowFunctionFactory: 이름으로 WindowFunction 생성
 // ============================================================================
 inline std::unique_ptr<WindowFunction> make_window_function(
     const std::string& name,
     int64_t offset = 1,
-    int64_t default_val = 0)
+    int64_t default_val = 0,
+    double ema_alpha = 0.1)
 {
     if (name == "ROW_NUMBER" || name == "row_number") {
         return std::make_unique<WindowRowNumber>();
@@ -546,6 +679,12 @@ inline std::unique_ptr<WindowFunction> make_window_function(
         return std::make_unique<WindowLag>(offset, default_val);
     } else if (name == "LEAD" || name == "lead") {
         return std::make_unique<WindowLead>(offset, default_val);
+    } else if (name == "EMA" || name == "ema") {
+        return std::make_unique<WindowEMA>(ema_alpha);
+    } else if (name == "DELTA" || name == "delta") {
+        return std::make_unique<WindowDelta>();
+    } else if (name == "RATIO" || name == "ratio") {
+        return std::make_unique<WindowRatio>();
     }
     throw std::runtime_error("Unknown window function: " + name);
 }

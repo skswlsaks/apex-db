@@ -113,14 +113,16 @@ SelectStmt Parser::parse_select() {
         && current().type != TokenType::ORDER
         && current().type != TokenType::LIMIT
         && current().type != TokenType::INNER
-        && current().type != TokenType::LEFT) {
+        && current().type != TokenType::LEFT
+        && current().type != TokenType::WINDOW) {
         stmt.from_alias = current().value;
         advance();
     }
 
-    // JOIN (ASOF JOIN, INNER JOIN, JOIN)
+    // JOIN (ASOF JOIN, INNER JOIN, JOIN, LEFT JOIN, WINDOW JOIN)
     if (check(TokenType::ASOF) || check(TokenType::JOIN)
-        || check(TokenType::INNER) || check(TokenType::LEFT)) {
+        || check(TokenType::INNER) || check(TokenType::LEFT)
+        || check(TokenType::WINDOW)) {
         stmt.join = parse_join();
     }
 
@@ -174,6 +176,14 @@ SelectExpr Parser::parse_select_expr() {
             std::string alias2, col2;
             parse_qualified_name(alias2, col2);
             expr.agg_arg2 = col2;
+        } else if (func == AggFunc::XBAR) {
+            // XBAR(col, bucket_size)
+            std::string alias, col;
+            parse_qualified_name(alias, col);
+            expr.table_alias = alias;
+            expr.column = col;
+            expect(TokenType::COMMA, ",");
+            expr.xbar_bucket = parse_integer_literal();
         } else {
             std::string alias, col;
             parse_qualified_name(alias, col);
@@ -196,7 +206,24 @@ SelectExpr Parser::parse_select_expr() {
             expr.column = col;
             if (has_offset && check(TokenType::COMMA)) {
                 advance();
-                expr.window_offset = parse_integer_literal();
+                // EMA: alpha (float) 또는 period (integer)
+                if (wf == WindowFunc::EMA) {
+                    if (check(TokenType::NUMBER)) {
+                        std::string s = current().value;
+                        advance();
+                        if (s.find('.') != std::string::npos) {
+                            // float → alpha 직접
+                            expr.ema_alpha = std::stod(s);
+                            expr.ema_period = 0;
+                        } else {
+                            // integer → period (alpha = 2/(period+1))
+                            expr.ema_period = std::stoll(s);
+                            expr.ema_alpha  = 2.0 / (expr.ema_period + 1.0);
+                        }
+                    }
+                } else {
+                    expr.window_offset = parse_integer_literal();
+                }
             }
         }
         expect(TokenType::RPAREN, ")");
@@ -216,12 +243,40 @@ SelectExpr Parser::parse_select_expr() {
         case TokenType::MAX:   advance(); parse_agg(AggFunc::MAX);   break;
         case TokenType::VWAP:  advance(); parse_agg(AggFunc::VWAP);  break;
 
+        // kdb+ 스타일 집계 함수
+        case TokenType::XBAR:  advance(); parse_agg(AggFunc::XBAR);  break;
+        case TokenType::FIRST: {
+            // FIRST는 집계 함수로 사용
+            advance();
+            // FIRST를 집계로 처리 (NULLS FIRST 와 구분 — 함수 호출 형식)
+            if (check(TokenType::LPAREN)) {
+                parse_agg(AggFunc::FIRST);
+            } else {
+                // ORDER BY NULLS FIRST 맥락에서는 IDENT로 처리
+                expr.column = "FIRST";
+            }
+            break;
+        }
+        case TokenType::LAST: {
+            advance();
+            if (check(TokenType::LPAREN)) {
+                parse_agg(AggFunc::LAST);
+            } else {
+                expr.column = "LAST";
+            }
+            break;
+        }
+
         // 윈도우 함수 (OVER 절 필수)
         case TokenType::ROW_NUMBER:  advance(); parse_window_func(WindowFunc::ROW_NUMBER, false, false); break;
         case TokenType::RANK:        advance(); parse_window_func(WindowFunc::RANK, false, false);       break;
         case TokenType::DENSE_RANK:  advance(); parse_window_func(WindowFunc::DENSE_RANK, false, false); break;
         case TokenType::LAG:         advance(); parse_window_func(WindowFunc::LAG, true, true);          break;
         case TokenType::LEAD:        advance(); parse_window_func(WindowFunc::LEAD, true, true);         break;
+        // 금융 윈도우 함수
+        case TokenType::EMA:         advance(); parse_window_func(WindowFunc::EMA, true, true);          break;
+        case TokenType::DELTA:       advance(); parse_window_func(WindowFunc::DELTA, true, false);       break;
+        case TokenType::RATIO:       advance(); parse_window_func(WindowFunc::RATIO, true, false);       break;
 
         case TokenType::STAR:
             advance();
@@ -230,8 +285,34 @@ SelectExpr Parser::parse_select_expr() {
 
         default: {
             // 일반 컬럼: [alias.]col
-            // SUM/AVG/MIN/MAX + OVER → 윈도우 SUM/AVG/MIN/MAX
-            // (이미 위에서 처리됨; 여기서는 테이블 컬럼 이름으로 처리)
+            // 단, wj_avg(col), wj_sum(col), wj_count(col) 등 처리
+            if (check(TokenType::IDENT)) {
+                std::string name = current().value;
+                // 대문자 변환
+                std::string upper = name;
+                std::transform(upper.begin(), upper.end(), upper.begin(),
+                               [](unsigned char c){ return std::toupper(c); });
+
+                // wj_ 접두사 윈도우 조인 집계 함수
+                if (upper.size() > 3 && upper.substr(0, 3) == "WJ_") {
+                    advance(); // 함수 이름 소비
+                    std::string agg_type = upper.substr(3);
+                    if      (agg_type == "AVG")   expr.wj_agg = WJAggFunc::AVG;
+                    else if (agg_type == "SUM")   expr.wj_agg = WJAggFunc::SUM;
+                    else if (agg_type == "COUNT") expr.wj_agg = WJAggFunc::COUNT;
+                    else if (agg_type == "MIN")   expr.wj_agg = WJAggFunc::MIN;
+                    else if (agg_type == "MAX")   expr.wj_agg = WJAggFunc::MAX;
+                    else throw std::runtime_error("Unknown wj_ aggregate: " + name);
+                    expect(TokenType::LPAREN, "(");
+                    std::string alias, col;
+                    parse_qualified_name(alias, col);
+                    expr.table_alias = alias;
+                    expr.column = col;
+                    expect(TokenType::RPAREN, ")");
+                    break;
+                }
+            }
+            // 일반 컬럼 처리
             std::string alias, col;
             parse_qualified_name(alias, col);
             expr.table_alias = alias;
@@ -240,8 +321,6 @@ SelectExpr Parser::parse_select_expr() {
             } else {
                 expr.column = col;
             }
-            // OVER 절이 있으면 → 윈도우 함수 (SUM, AVG, MIN, MAX)
-            // 위에서 이미 case로 잡혔으므로 여기선 불필요
             break;
         }
     }
@@ -266,9 +345,20 @@ SelectExpr Parser::parse_select_expr() {
         }
     }
 
-    // AS alias
+    // AS alias — 키워드도 alias로 허용 (delta, ratio, ema, bar 등)
     if (match(TokenType::AS)) {
-        expr.alias = expect(TokenType::IDENT, "column alias").value;
+        // alias는 IDENT 또는 임의의 키워드 (delta, ema, bar 등)
+        // 현재 토큰을 alias로 취급
+        if (!at_end() && current().type != TokenType::COMMA
+            && current().type != TokenType::FROM
+            && current().type != TokenType::WHERE
+            && current().type != TokenType::GROUP
+            && current().type != TokenType::ORDER
+            && current().type != TokenType::LIMIT
+            && current().type != TokenType::END) {
+            expr.alias = current().value;
+            advance();
+        }
     } else if (check(TokenType::IDENT)
                && current().value != "FROM"
                && current().type != TokenType::FROM) {
@@ -409,6 +499,12 @@ JoinClause Parser::parse_join() {
         expect(TokenType::JOIN, "JOIN");
         jc.type = JoinClause::Type::LEFT;
     }
+    // WINDOW JOIN — kdb+ wj 스타일
+    else if (check(TokenType::WINDOW)) {
+        advance();
+        expect(TokenType::JOIN, "JOIN");
+        jc.type = JoinClause::Type::WINDOW;
+    }
     // JOIN (기본 INNER)
     else {
         expect(TokenType::JOIN, "JOIN");
@@ -427,13 +523,68 @@ JoinClause Parser::parse_join() {
     // ON 절
     expect(TokenType::ON, "ON");
 
-    // ON 조건 파싱: t.col op q.col [AND ...]
-    auto parse_join_cond = [&]() {
+    // ON 조건 파싱
+    // WINDOW JOIN 특수 처리: col BETWEEN expr AND expr
+    auto parse_join_cond = [&]() -> bool {
+        // qualified_name 파싱 시작
+        // WINDOW JOIN: col BETWEEN l_expr AND r_expr 처리
+        std::string left_alias, left_col;
+
+        // 먼저 테이블.컬럼 파싱
+        parse_qualified_name(left_alias, left_col);
+
+        // BETWEEN 체크 (WINDOW JOIN 시간 조건)
+        if (check(TokenType::BETWEEN)) {
+            advance(); // BETWEEN 소비
+            // 왼쪽 경계: expr (가능하면 col - N 또는 col + N)
+            // 간단히: IDENT [DOT IDENT] [MINUS/PLUS NUMBER]
+            std::string ref_alias, ref_col;
+            parse_qualified_name(ref_alias, ref_col);
+            int64_t offset_before = 0;
+            bool subtract_before = false;
+            if (check(TokenType::MINUS)) {
+                advance();
+                offset_before = parse_integer_literal();
+                subtract_before = true;
+            } else if (check(TokenType::PLUS)) {
+                advance();
+                offset_before = parse_integer_literal();
+                subtract_before = false;
+            }
+            expect(TokenType::AND, "AND");
+            // 오른쪽 경계: col [+/- N]
+            std::string ref_alias2, ref_col2;
+            parse_qualified_name(ref_alias2, ref_col2);
+            int64_t offset_after = 0;
+            bool add_after = true;
+            if (check(TokenType::MINUS)) {
+                advance();
+                offset_after = parse_integer_literal();
+                add_after = false;
+            } else if (check(TokenType::PLUS)) {
+                advance();
+                offset_after = parse_integer_literal();
+                add_after = true;
+            }
+
+            // WINDOW JOIN 파라미터 채우기
+            jc.wj_right_time_col = left_col;
+            jc.wj_left_time_col = ref_col; // t.timestamp 등
+            // wj_window_before: t.ts - X → X
+            jc.wj_window_before = subtract_before ? offset_before : 0;
+            // wj_window_after: t.ts + X → X
+            jc.wj_window_after = add_after ? offset_after : 0;
+            return true; // BETWEEN 처리됨 — JoinCondition은 따로 추가 안 함
+        }
+
+        // 일반 비교 조건
         JoinCondition cond;
-        parse_qualified_name(cond.left_alias, cond.left_col);
+        cond.left_alias = left_alias;
+        cond.left_col   = left_col;
         cond.op = parse_compare_op();
         parse_qualified_name(cond.right_alias, cond.right_col);
         jc.on_conditions.push_back(std::move(cond));
+        return false;
     };
 
     parse_join_cond();
@@ -557,15 +708,33 @@ std::shared_ptr<Expr> Parser::parse_primary_expr() {
 // ============================================================================
 GroupByClause Parser::parse_group_by() {
     GroupByClause gc;
-    std::string alias, col;
-    parse_qualified_name(alias, col);
-    gc.aliases.push_back(alias);
-    gc.columns.push_back(col);
 
+    // 단일 GROUP BY 항목 파싱 람다
+    auto parse_one = [&]() {
+        if (check(TokenType::XBAR)) {
+            // XBAR(col, bucket) in GROUP BY
+            advance(); // XBAR 소비
+            expect(TokenType::LPAREN, "(");
+            std::string alias, col;
+            parse_qualified_name(alias, col);
+            expect(TokenType::COMMA, ",");
+            int64_t bucket = parse_integer_literal();
+            expect(TokenType::RPAREN, ")");
+            gc.aliases.push_back(alias);
+            gc.columns.push_back(col);
+            gc.xbar_buckets.push_back(bucket);
+        } else {
+            std::string alias, col;
+            parse_qualified_name(alias, col);
+            gc.aliases.push_back(alias);
+            gc.columns.push_back(col);
+            gc.xbar_buckets.push_back(0); // 0 = 일반 컬럼
+        }
+    };
+
+    parse_one();
     while (match(TokenType::COMMA)) {
-        parse_qualified_name(alias, col);
-        gc.aliases.push_back(alias);
-        gc.columns.push_back(col);
+        parse_one();
     }
     return gc;
 }

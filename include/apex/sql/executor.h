@@ -98,6 +98,12 @@ private:
         const std::vector<apex::storage::Partition*>& left_partitions,
         const std::vector<apex::storage::Partition*>& right_partitions);
 
+    // WINDOW JOIN 실행 (kdb+ wj 스타일)
+    QueryResultSet exec_window_join(
+        const SelectStmt& stmt,
+        const std::vector<apex::storage::Partition*>& left_partitions,
+        const std::vector<apex::storage::Partition*>& right_partitions);
+
     // 윈도우 함수 적용 (결과에 새 컬럼 추가)
     void apply_window_functions(
         const SelectStmt& stmt,

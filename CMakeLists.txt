@@ -196,6 +196,7 @@ endif()
 add_library(apex_execution STATIC
     src/execution/vectorized_engine.cpp
     src/execution/query_planner.cpp
+    src/execution/join_operator.cpp
 )
 if(APEX_USE_JIT)
     target_sources(apex_execution PRIVATE src/execution/jit_engine.cpp)
@@ -311,6 +312,7 @@ if(APEX_BUILD_BENCH)
         apex_storage
         apex_ingestion
         apex_execution
+        apex_common
     )
     target_compile_options(bench_simd_jit PRIVATE
         -O3 -march=native

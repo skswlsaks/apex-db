@@ -62,6 +62,12 @@ TokenType Tokenizer::keyword_type(const std::string& upper) {
     if (upper == "ROW_NUMBER")  return TokenType::ROW_NUMBER;
     if (upper == "LAG")         return TokenType::LAG;
     if (upper == "LEAD")        return TokenType::LEAD;
+    // 금융 함수 키워드
+    if (upper == "XBAR")        return TokenType::XBAR;
+    if (upper == "EMA")         return TokenType::EMA;
+    if (upper == "DELTA")       return TokenType::DELTA;
+    if (upper == "RATIO")       return TokenType::RATIO;
+    if (upper == "WINDOW")      return TokenType::WINDOW;
     // 일반 식별자
     return TokenType::IDENT;
 }
@@ -165,12 +171,30 @@ std::vector<Token> Tokenizer::tokenize(const std::string& sql) {
             continue;
         }
 
-        // 음수 리터럴 (-123)
+        // '-' 처리: 항상 MINUS 토큰으로 처리
+        // 음수 리터럴 파싱은 파서 레벨에서 MINUS + NUMBER로 처리됨
         if (c == '-' && std::isdigit(static_cast<unsigned char>(peek(1)))) {
-            advance(); // '-'
-            Token t = read_number();
-            t.value = "-" + t.value;
-            tokens.push_back(std::move(t));
+            // 직전 토큰에 따라 결정:
+            // - 직전이 RPAREN/NUMBER/IDENT이면 이항 MINUS
+            // - 그 외 (시작, 괄호 안, 연산자 뒤)이면 음수 리터럴
+            bool is_binary = false;
+            if (!tokens.empty()) {
+                auto tt = tokens.back().type;
+                if (tt == TokenType::RPAREN || tt == TokenType::NUMBER ||
+                    tt == TokenType::IDENT) {
+                    is_binary = true;
+                }
+            }
+            if (is_binary) {
+                advance(); // '-' 소비
+                tokens.push_back({TokenType::MINUS, "-"});
+            } else {
+                // 음수 리터럴: '-' + digits → 단일 NUMBER 토큰
+                advance(); // '-'
+                Token t = read_number();
+                t.value = "-" + t.value;
+                tokens.push_back(std::move(t));
+            }
             continue;
         }
 
@@ -204,6 +228,8 @@ std::vector<Token> Tokenizer::tokenize(const std::string& sql) {
             case '(': tokens.push_back({TokenType::LPAREN,"("}); break;
             case ')': tokens.push_back({TokenType::RPAREN,")"}); break;
             case '*': tokens.push_back({TokenType::STAR,  "*"}); break;
+            case '+': tokens.push_back({TokenType::PLUS,  "+"}); break;
+            case '-': tokens.push_back({TokenType::MINUS, "-"}); break;
             case '=': tokens.push_back({TokenType::EQ,    "="}); break;
             case '>':
                 if (!at_end() && peek() == '=') {
