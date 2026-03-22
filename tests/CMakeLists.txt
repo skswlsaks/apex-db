@@ -12,6 +12,7 @@ add_executable(apex_tests
     unit/test_hdb.cpp
     unit/test_cluster.cpp
     unit/test_cxl_backend.cpp
+    unit/test_sql.cpp
 )
 target_include_directories(apex_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/cluster   # shm_backend.h 접근
@@ -22,6 +23,7 @@ target_link_libraries(apex_tests PRIVATE
     apex_execution
     apex_core
     apex_cluster
+    apex_sql
     GTest::gtest_main
 )
 

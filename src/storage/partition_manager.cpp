@@ -32,6 +32,13 @@ ColumnVector* Partition::get_column(const std::string& name) {
     return nullptr;
 }
 
+const ColumnVector* Partition::get_column(const std::string& name) const {
+    for (const auto& col : columns_) {
+        if (col->name() == name) return col.get();
+    }
+    return nullptr;
+}
+
 size_t Partition::num_rows() const {
     if (columns_.empty()) return 0;
     return columns_[0]->size();
@@ -111,6 +118,25 @@ std::vector<Partition*> PartitionManager::get_sealed_partitions() {
     std::vector<Partition*> result;
     for (auto& [key, partition] : partitions_) {
         if (partition->state() == Partition::State::SEALED) {
+            result.push_back(partition.get());
+        }
+    }
+    return result;
+}
+
+std::vector<Partition*> PartitionManager::get_all_partitions() {
+    std::vector<Partition*> result;
+    result.reserve(partitions_.size());
+    for (auto& [key, partition] : partitions_) {
+        result.push_back(partition.get());
+    }
+    return result;
+}
+
+std::vector<Partition*> PartitionManager::get_partitions_for_symbol(SymbolId symbol) {
+    std::vector<Partition*> result;
+    for (auto& [key, partition] : partitions_) {
+        if (key.symbol_id == symbol) {
             result.push_back(partition.get());
         }
     }

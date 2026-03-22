@@ -230,6 +230,35 @@ target_link_libraries(apex_core PUBLIC
     apex_execution
 )
 
+# --- Layer 5: SQL Parser + Executor ---
+add_library(apex_sql STATIC
+    src/sql/tokenizer.cpp
+    src/sql/parser.cpp
+    src/sql/executor.cpp
+    src/execution/join_operator.cpp
+)
+target_include_directories(apex_sql PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(apex_sql PUBLIC
+    apex_core
+)
+
+# --- Layer 6: HTTP API Server ---
+add_library(apex_server STATIC
+    src/server/http_server.cpp
+)
+target_include_directories(apex_server PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}  # third_party/httplib.h 접근용
+)
+target_link_libraries(apex_server PUBLIC
+    apex_sql
+)
+# httplib은 POSIX threads 필요
+find_package(Threads REQUIRED)
+target_link_libraries(apex_server PUBLIC Threads::Threads)
+
 # --- Phase C: Cluster (분산 메모리 & 트랜스포트) ---
 add_library(apex_cluster STATIC
     src/cluster/shm_backend.cpp
@@ -331,6 +360,20 @@ if(APEX_BUILD_BENCH)
         apex_execution
     )
     target_compile_options(bench_cxl PRIVATE
+        -O3 -march=native
+    )
+    # SQL 벤치마크
+    add_executable(bench_sql
+        tests/bench/bench_sql.cpp
+    )
+    target_link_libraries(bench_sql PRIVATE
+        apex_sql
+        apex_core
+        apex_storage
+        apex_ingestion
+        apex_execution
+    )
+    target_compile_options(bench_sql PRIVATE
         -O3 -march=native
     )
 endif()

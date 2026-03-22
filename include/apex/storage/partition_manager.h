@@ -63,6 +63,7 @@ public:
 
     /// 컬럼 접근
     [[nodiscard]] ColumnVector* get_column(const std::string& name);
+    [[nodiscard]] const ColumnVector* get_column(const std::string& name) const;
     [[nodiscard]] const std::vector<std::unique_ptr<ColumnVector>>& columns() const {
         return columns_;
     }
@@ -106,6 +107,12 @@ public:
 
     /// SEALED 상태인 파티션 목록 반환 (FlushManager에서 사용)
     std::vector<Partition*> get_sealed_partitions();
+
+    /// 전체 파티션 목록 반환 (SQL 쿼리 실행용)
+    std::vector<Partition*> get_all_partitions();
+
+    /// 특정 Symbol의 파티션 목록 반환
+    std::vector<Partition*> get_partitions_for_symbol(SymbolId symbol);
 
     /// 전체 파티션 수
     [[nodiscard]] size_t partition_count() const { return partitions_.size(); }
