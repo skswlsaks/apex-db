@@ -1,0 +1,191 @@
+{
+  "dashboard": {
+    "title": "APEX-DB Production Dashboard",
+    "tags": ["apex-db", "timeseries", "production"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Server Status",
+        "type": "stat",
+        "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "apex_server_up",
+            "legendFormat": "Up"
+          },
+          {
+            "expr": "apex_server_ready",
+            "legendFormat": "Ready"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "mappings": [
+              {"type": "value", "value": "0", "text": "DOWN", "color": "red"},
+              {"type": "value", "value": "1", "text": "UP", "color": "green"}
+            ]
+          }
+        }
+      },
+      {
+        "id": 2,
+        "title": "Ingestion Rate (ticks/sec)",
+        "type": "graph",
+        "gridPos": {"x": 6, "y": 0, "w": 9, "h": 8},
+        "targets": [
+          {
+            "expr": "rate(apex_ticks_ingested_total[1m])",
+            "legendFormat": "Ingested"
+          },
+          {
+            "expr": "rate(apex_ticks_stored_total[1m])",
+            "legendFormat": "Stored"
+          },
+          {
+            "expr": "rate(apex_ticks_dropped_total[1m])",
+            "legendFormat": "Dropped"
+          }
+        ],
+        "yaxes": [
+          {"label": "ticks/sec", "format": "short"}
+        ]
+      },
+      {
+        "id": 3,
+        "title": "Query Throughput (queries/sec)",
+        "type": "graph",
+        "gridPos": {"x": 15, "y": 0, "w": 9, "h": 8},
+        "targets": [
+          {
+            "expr": "rate(apex_queries_executed_total[1m])",
+            "legendFormat": "Queries"
+          }
+        ],
+        "yaxes": [
+          {"label": "queries/sec", "format": "short"}
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Total Ticks Ingested",
+        "type": "stat",
+        "gridPos": {"x": 0, "y": 4, "w": 6, "h": 4},
+        "targets": [
+          {
+            "expr": "apex_ticks_ingested_total"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "decimals": 0
+          }
+        }
+      },
+      {
+        "id": 5,
+        "title": "Rows Scanned Rate (rows/sec)",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "rate(apex_rows_scanned_total[1m])",
+            "legendFormat": "Rows Scanned"
+          }
+        ],
+        "yaxes": [
+          {"label": "rows/sec", "format": "short"}
+        ]
+      },
+      {
+        "id": 6,
+        "title": "CPU Usage (%)",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "100 - (avg by(instance) (irate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)",
+            "legendFormat": "CPU Usage"
+          }
+        ],
+        "yaxes": [
+          {"label": "%", "format": "percent", "max": 100, "min": 0}
+        ]
+      },
+      {
+        "id": 7,
+        "title": "Memory Usage",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 16, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes",
+            "legendFormat": "Used"
+          },
+          {
+            "expr": "node_memory_MemAvailable_bytes",
+            "legendFormat": "Available"
+          }
+        ],
+        "yaxes": [
+          {"label": "bytes", "format": "bytes"}
+        ]
+      },
+      {
+        "id": 8,
+        "title": "Disk Usage (/data)",
+        "type": "graph",
+        "gridPos": {"x": 12, "y": 16, "w": 12, "h": 8},
+        "targets": [
+          {
+            "expr": "node_filesystem_size_bytes{mountpoint=\"/data\"} - node_filesystem_avail_bytes{mountpoint=\"/data\"}",
+            "legendFormat": "Used"
+          },
+          {
+            "expr": "node_filesystem_avail_bytes{mountpoint=\"/data\"}",
+            "legendFormat": "Available"
+          }
+        ],
+        "yaxes": [
+          {"label": "bytes", "format": "bytes"}
+        ]
+      },
+      {
+        "id": 9,
+        "title": "Drop Rate (ticks/sec)",
+        "type": "graph",
+        "gridPos": {"x": 0, "y": 24, "w": 24, "h": 6},
+        "targets": [
+          {
+            "expr": "rate(apex_ticks_dropped_total[1m])",
+            "legendFormat": "Dropped"
+          }
+        ],
+        "yaxes": [
+          {"label": "ticks/sec", "format": "short"}
+        ],
+        "alert": {
+          "conditions": [
+            {
+              "evaluator": {"params": [1000], "type": "gt"},
+              "query": {"params": ["A", "5m", "now"]},
+              "type": "query"
+            }
+          ],
+          "frequency": "1m",
+          "handler": 1,
+          "name": "High Drop Rate Alert",
+          "noDataState": "no_data",
+          "notifications": []
+        }
+      }
+    ],
+    "refresh": "5s",
+    "time": {"from": "now-1h", "to": "now"},
+    "timepicker": {
+      "refresh_intervals": ["5s", "10s", "30s", "1m", "5m"]
+    },
+    "version": 1
+  }
+}

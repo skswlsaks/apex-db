@@ -1,0 +1,55 @@
+# ============================================================================
+# Prometheus 설정 - APEX-DB 모니터링
+# ============================================================================
+# 용도: APEX-DB 메트릭 수집
+# 배포: /etc/prometheus/prometheus.yml
+# ============================================================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'apex-db-production'
+
+# Alertmanager 설정
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - 'localhost:9093'
+
+# 알림 규칙 로드
+rule_files:
+  - "apex-db-alerts.yml"
+
+# 스크랩 설정
+scrape_configs:
+  # ========== APEX-DB 메트릭 ==========
+  - job_name: 'apex-db'
+    static_configs:
+      - targets:
+          - 'localhost:8123'
+    metrics_path: '/metrics'
+    scrape_interval: 5s
+
+    # 라벨 추가
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: target
+        replacement: 'apex-db-server'
+
+  # ========== Node Exporter (시스템 메트릭) ==========
+  - job_name: 'node'
+    static_configs:
+      - targets:
+          - 'localhost:9100'
+
+  # ========== Prometheus 자체 모니터링 ==========
+  - job_name: 'prometheus'
+    static_configs:
+      - targets:
+          - 'localhost:9090'
