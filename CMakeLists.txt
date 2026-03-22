@@ -197,6 +197,10 @@ add_library(apex_execution STATIC
     src/execution/vectorized_engine.cpp
     src/execution/query_planner.cpp
     src/execution/join_operator.cpp
+    src/execution/worker_pool.cpp
+    src/execution/parallel_scan.cpp
+    src/execution/local_scheduler.cpp
+    src/execution/distributed_scheduler.cpp
 )
 if(APEX_USE_JIT)
     target_sources(apex_execution PRIVATE src/execution/jit_engine.cpp)
@@ -204,9 +208,11 @@ endif()
 target_include_directories(apex_execution PUBLIC
     ${CMAKE_SOURCE_DIR}/include
 )
+find_package(Threads REQUIRED)
 target_link_libraries(apex_execution PUBLIC
     apex_common
     apex_storage
+    Threads::Threads
 )
 if(APEX_USE_HIGHWAY)
     target_link_libraries(apex_execution PUBLIC PkgConfig::HWY)
@@ -378,6 +384,21 @@ if(APEX_BUILD_BENCH)
         apex_execution
     )
     target_compile_options(bench_sql PRIVATE
+        -O3 -march=native
+    )
+
+    # 병렬 쿼리 벤치마크
+    add_executable(bench_parallel
+        tests/bench/bench_parallel.cpp
+    )
+    target_link_libraries(bench_parallel PRIVATE
+        apex_sql
+        apex_core
+        apex_storage
+        apex_ingestion
+        apex_execution
+    )
+    target_compile_options(bench_parallel PRIVATE
         -O3 -march=native
     )
 endif()

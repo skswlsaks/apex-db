@@ -1,5 +1,5 @@
 # High-Level DB Software Architecture Design
-# ⚠️ 최종 업데이트: 2026-03-22 (Phase C + SQL + JOIN + Window 반영)
+# ⚠️ 최종 업데이트: 2026-03-22 (devlog #011: 병렬 쿼리 엔진 + QueryScheduler DI 반영)
 
 ## Overview
 
@@ -33,6 +33,13 @@ HFT 특화로 시작했지만 범용 OLAP, TSDb, ML Feature Store로 확장됨.
 │  │ BitMask filter│  │              │  │ Window Funcs  │  │
 │  │ 272μs/1M      │  │              │  │ (prefix sum)  │  │
 │  └───────────────┘  └──────────────┘  └──────────────┘  │
+│  ┌──────────────────────────────────────────────────┐    │
+│  │ QueryScheduler (DI 패턴, devlog #011)             │    │
+│  │  LocalQueryScheduler  │  DistributedScheduler(stub)   │
+│  │  WorkerPool (jthread) │  → UCX transport (향후)   │    │
+│  │  scatter/gather API   │  PartialAggResult merge   │    │
+│  │  GROUP BY 3.48x (8T)  │  코드 변경 없이 노드 추가 │    │
+│  └──────────────────────────────────────────────────┘    │
 ├──────────────────────────────────────────────────────────┤
 │  Layer 2: Ingestion (Tick Plant)                          │
 │  ┌───────────────┐  ┌──────────────┐  ┌──────────────┐  │
@@ -71,6 +78,7 @@ HFT 특화로 시작했지만 범용 OLAP, TSDb, ML Feature Store로 확장됨.
 | ASOF Join 1M | 53ms | binary search |
 | HDB flush | 4.8 GB/s | NVMe sequential |
 | SQL 파싱 | 1.5~4.5μs | recursive descent |
+| GROUP BY 병렬 (8T) | 0.248ms/1M | 직렬 대비 3.48x |
 | Transport (SHM) | 13.5ns | CXL sim baseline |
 | Partition routing | 2.0ns | consistent hash |
 | Python zero-copy | 522ns | pybind11 numpy |

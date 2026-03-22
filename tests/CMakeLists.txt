@@ -15,6 +15,7 @@ add_executable(apex_tests
     unit/test_sql.cpp
     unit/test_join_window.cpp
     unit/test_financial_functions.cpp
+    unit/test_parallel.cpp
 )
 target_include_directories(apex_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/cluster   # shm_backend.h 접근

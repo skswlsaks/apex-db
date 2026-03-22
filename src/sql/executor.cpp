@@ -9,12 +9,15 @@
 #include "apex/execution/join_operator.h"
 #include "apex/execution/window_function.h"
 #include "apex/execution/vectorized_engine.h"
+#include "apex/execution/parallel_scan.h"
+#include "apex/execution/local_scheduler.h"
 #include "apex/common/logger.h"
 
 #include <algorithm>
 #include <chrono>
 #include <climits>
 #include <cstring>
+#include <mutex>
 #include <unordered_map>
 #include <stdexcept>
 
@@ -37,7 +40,40 @@ static inline double now_us() {
 // 생성자
 // ============================================================================
 QueryExecutor::QueryExecutor(ApexPipeline& pipeline)
-    : pipeline_(pipeline) {}
+    : pipeline_(pipeline)
+{
+    // 기본: LocalQueryScheduler (hardware_concurrency 스레드)
+    auto local = std::make_unique<apex::execution::LocalQueryScheduler>(pipeline);
+    pool_raw_  = &local->pool();
+    scheduler_ = std::move(local);
+}
+
+QueryExecutor::QueryExecutor(ApexPipeline& pipeline,
+                             std::unique_ptr<apex::execution::QueryScheduler> sched)
+    : pipeline_(pipeline)
+    , scheduler_(std::move(sched))
+    , pool_raw_(nullptr)  // 비-로컬 스케줄러: 직렬 폴백
+{}
+
+void QueryExecutor::enable_parallel(size_t num_threads, size_t row_threshold) {
+    par_opts_.enabled      = true;
+    par_opts_.num_threads  = num_threads;
+    par_opts_.row_threshold = row_threshold;
+    // 지정된 스레드 수로 LocalQueryScheduler 재생성
+    auto local = std::make_unique<apex::execution::LocalQueryScheduler>(
+        pipeline_, num_threads);
+    pool_raw_  = &local->pool();
+    scheduler_ = std::move(local);
+}
+
+void QueryExecutor::disable_parallel() {
+    par_opts_.enabled = false;
+    // 단일 스레드 스케줄러로 교체
+    auto local = std::make_unique<apex::execution::LocalQueryScheduler>(
+        pipeline_, 1);
+    pool_raw_  = &local->pool();
+    scheduler_ = std::move(local);
+}
 
 const PipelineStats& QueryExecutor::stats() const {
     return pipeline_.stats();
@@ -485,12 +521,36 @@ QueryResultSet QueryExecutor::exec_simple_select(
 }
 
 // ============================================================================
+// 총 행 수 추정
+// ============================================================================
+size_t QueryExecutor::estimate_total_rows(
+    const std::vector<Partition*>& partitions) const
+{
+    size_t total = 0;
+    for (auto* p : partitions) total += p->num_rows();
+    return total;
+}
+
+// ============================================================================
 // 집계 실행 (GROUP BY 없음)
 // ============================================================================
 QueryResultSet QueryExecutor::exec_agg(
     const SelectStmt& stmt,
     const std::vector<Partition*>& partitions)
 {
+    // 병렬 경로: 활성화 + pool_raw_ 존재 + 스레드 수 > 1 + 임계값 초과 시
+    if (par_opts_.enabled && pool_raw_ &&
+        pool_raw_->num_threads() > 1 &&
+        estimate_total_rows(partitions) >= par_opts_.row_threshold &&
+        partitions.size() >= 2)
+    {
+        try {
+            return exec_agg_parallel(stmt, partitions);
+        } catch (...) {
+            // 폴백: 직렬 실행
+        }
+    }
+
     QueryResultSet result;
     size_t rows_scanned = 0;
 
@@ -648,7 +708,7 @@ QueryResultSet QueryExecutor::exec_agg(
 // ============================================================================
 // GROUP BY + 집계
 // ============================================================================
-// 최적화 전략:
+// 최적화 전략 (직렬 경로):
 //   1. GROUP BY symbol: 파티션 구조 직접 활용 — 각 파티션이 이미 symbol별로
 //      분리되어 있으므로 hash table 불필요. O(partitions) not O(rows).
 //   2. GROUP BY 기타 컬럼: pre-allocated hash map으로 O(n) 집계
@@ -658,6 +718,19 @@ QueryResultSet QueryExecutor::exec_group_agg(
     const SelectStmt& stmt,
     const std::vector<Partition*>& partitions)
 {
+    // 병렬 경로: 활성화 + pool_raw_ 존재 + 스레드 수 > 1 + 임계값 초과 시
+    if (par_opts_.enabled && pool_raw_ &&
+        pool_raw_->num_threads() > 1 &&
+        estimate_total_rows(partitions) >= par_opts_.row_threshold &&
+        partitions.size() >= 2)
+    {
+        try {
+            return exec_group_agg_parallel(stmt, partitions);
+        } catch (...) {
+            // 폴백: 직렬 실행
+        }
+    }
+
     QueryResultSet result;
     size_t rows_scanned = 0;
 
@@ -1518,5 +1591,457 @@ QueryResultSet QueryExecutor::exec_window_join(
     return result;
 }
 
+
+// ============================================================================
+// 병렬 집계 구현 (GROUP BY 없음)
+// ============================================================================
+// 전략:
+//   1. 파티션 목록을 N청크로 분할
+//   2. 각 스레드가 청크 내 파티션의 부분 집계 계산
+//   3. 메인 스레드가 부분 집계 머지
+// ============================================================================
+QueryResultSet QueryExecutor::exec_agg_parallel(
+    const SelectStmt& stmt,
+    const std::vector<Partition*>& partitions)
+{
+    using namespace apex::execution;
+
+    size_t n_threads = pool_raw_->num_threads();
+    ParallelScanExecutor pse(*pool_raw_);
+
+    // 파티션 분배 모드 결정
+    size_t total_rows = estimate_total_rows(partitions);
+    ParallelMode mode = ParallelScanExecutor::select_mode(
+        partitions.size(), total_rows, n_threads, par_opts_.row_threshold);
+
+    if (mode == ParallelMode::SERIAL) {
+        return exec_agg(stmt, partitions); // 재귀 방지를 위해 직렬 실행
+    }
+
+    // 타임스탬프 범위 최적화
+    int64_t ts_lo = INT64_MIN, ts_hi = INT64_MAX;
+    bool use_ts_index = extract_time_range(stmt, ts_lo, ts_hi);
+
+    size_t ncols = stmt.columns.size();
+
+    // PartialAgg: 스레드별 부분 집계 상태
+    struct PartialAgg {
+        std::vector<int64_t>  sum;
+        std::vector<double>   d_sum;
+        std::vector<int64_t>  cnt;
+        std::vector<int64_t>  minv;
+        std::vector<int64_t>  maxv;
+        std::vector<double>   vwap_pv;
+        std::vector<int64_t>  vwap_v;
+        std::vector<int64_t>  first_val;
+        std::vector<int64_t>  last_val;
+        std::vector<bool>     has_first;
+        size_t rows_scanned = 0;
+    };
+
+    auto init_partial = [&]() -> PartialAgg {
+        PartialAgg p;
+        p.sum.assign(ncols, 0);
+        p.d_sum.assign(ncols, 0.0);
+        p.cnt.assign(ncols, 0);
+        p.minv.assign(ncols, INT64_MAX);
+        p.maxv.assign(ncols, INT64_MIN);
+        p.vwap_pv.assign(ncols, 0.0);
+        p.vwap_v.assign(ncols, 0);
+        p.first_val.assign(ncols, 0);
+        p.last_val.assign(ncols, 0);
+        p.has_first.assign(ncols, false);
+        return p;
+    };
+
+    auto chunks = ParallelScanExecutor::make_partition_chunks(
+        partitions,
+        (mode == ParallelMode::PARTITION) ? n_threads : 1);
+
+    auto partials = pse.parallel_for_chunks<PartialAgg>(
+        chunks,
+        init_partial,
+        [&](const std::vector<Partition*>& chunk, size_t /*tid*/, PartialAgg& pa) {
+            for (auto* part : chunk) {
+                size_t n = part->num_rows();
+
+                std::vector<uint32_t> sel_indices;
+                if (use_ts_index) {
+                    if (!part->overlaps_time_range(ts_lo, ts_hi)) continue;
+                    auto [r_begin, r_end] = part->timestamp_range(ts_lo, ts_hi);
+                    pa.rows_scanned += r_end - r_begin;
+                    sel_indices = eval_where_ranged(stmt, *part, r_begin, r_end);
+                } else {
+                    pa.rows_scanned += n;
+                    sel_indices = eval_where(stmt, *part, n);
+                }
+
+                for (size_t ci = 0; ci < ncols; ++ci) {
+                    const auto& col = stmt.columns[ci];
+                    const int64_t* data = get_col_data(*part, col.column);
+
+                    switch (col.agg) {
+                        case AggFunc::COUNT:
+                            pa.cnt[ci] += static_cast<int64_t>(sel_indices.size());
+                            break;
+                        case AggFunc::SUM:
+                            if (data) for (auto idx : sel_indices) pa.sum[ci] += data[idx];
+                            break;
+                        case AggFunc::AVG:
+                            if (data) for (auto idx : sel_indices) {
+                                pa.d_sum[ci] += static_cast<double>(data[idx]);
+                                pa.cnt[ci]++;
+                            }
+                            break;
+                        case AggFunc::MIN:
+                            if (data) for (auto idx : sel_indices)
+                                pa.minv[ci] = std::min(pa.minv[ci], data[idx]);
+                            break;
+                        case AggFunc::MAX:
+                            if (data) for (auto idx : sel_indices)
+                                pa.maxv[ci] = std::max(pa.maxv[ci], data[idx]);
+                            break;
+                        case AggFunc::FIRST:
+                        case AggFunc::LAST:
+                            if (data) for (auto idx : sel_indices) {
+                                if (!pa.has_first[ci]) {
+                                    pa.first_val[ci] = data[idx];
+                                    pa.has_first[ci] = true;
+                                }
+                                pa.last_val[ci] = data[idx];
+                            }
+                            break;
+                        case AggFunc::XBAR:
+                            if (data && !sel_indices.empty() && !pa.has_first[ci]) {
+                                int64_t b = col.xbar_bucket;
+                                int64_t v = data[sel_indices[0]];
+                                pa.first_val[ci] = b > 0 ? (v / b) * b : v;
+                                pa.has_first[ci] = true;
+                            }
+                            break;
+                        case AggFunc::VWAP: {
+                            const int64_t* vd = get_col_data(*part, col.agg_arg2);
+                            if (data && vd) for (auto idx : sel_indices) {
+                                pa.vwap_pv[ci] += static_cast<double>(data[idx])
+                                                * static_cast<double>(vd[idx]);
+                                pa.vwap_v[ci] += vd[idx];
+                            }
+                            break;
+                        }
+                        case AggFunc::NONE: break;
+                    }
+                }
+            }
+        }
+    );
+
+    // ── 머지 ──
+    PartialAgg merged = init_partial();
+    for (auto& pa : partials) {
+        merged.rows_scanned += pa.rows_scanned;
+        for (size_t ci = 0; ci < ncols; ++ci) {
+            merged.sum[ci]     += pa.sum[ci];
+            merged.d_sum[ci]   += pa.d_sum[ci];
+            merged.cnt[ci]     += pa.cnt[ci];
+            merged.minv[ci]     = std::min(merged.minv[ci], pa.minv[ci]);
+            merged.maxv[ci]     = std::max(merged.maxv[ci], pa.maxv[ci]);
+            merged.vwap_pv[ci] += pa.vwap_pv[ci];
+            merged.vwap_v[ci]  += pa.vwap_v[ci];
+            if (!merged.has_first[ci] && pa.has_first[ci]) {
+                merged.first_val[ci] = pa.first_val[ci];
+                merged.has_first[ci] = true;
+            }
+            if (pa.has_first[ci]) {
+                merged.last_val[ci] = pa.last_val[ci];
+            }
+        }
+    }
+
+    // ── 결과 조립 ──
+    QueryResultSet result;
+    std::vector<int64_t> row(ncols);
+    for (size_t ci = 0; ci < ncols; ++ci) {
+        const auto& col = stmt.columns[ci];
+        std::string name = col.alias.empty()
+            ? (col.column.empty() ? "*" : col.column) : col.alias;
+        result.column_names.push_back(name);
+        result.column_types.push_back(ColumnType::INT64);
+
+        switch (col.agg) {
+            case AggFunc::COUNT: row[ci] = merged.cnt[ci]; break;
+            case AggFunc::SUM:   row[ci] = merged.sum[ci]; break;
+            case AggFunc::AVG:
+                row[ci] = merged.cnt[ci] > 0
+                    ? static_cast<int64_t>(merged.d_sum[ci] / merged.cnt[ci]) : 0;
+                break;
+            case AggFunc::MIN:
+                row[ci] = (merged.minv[ci] == INT64_MAX) ? 0 : merged.minv[ci];
+                break;
+            case AggFunc::MAX:
+                row[ci] = (merged.maxv[ci] == INT64_MIN) ? 0 : merged.maxv[ci];
+                break;
+            case AggFunc::VWAP:
+                row[ci] = merged.vwap_v[ci] > 0
+                    ? static_cast<int64_t>(merged.vwap_pv[ci] / merged.vwap_v[ci]) : 0;
+                break;
+            case AggFunc::FIRST: row[ci] = merged.first_val[ci]; break;
+            case AggFunc::LAST:  row[ci] = merged.last_val[ci];  break;
+            case AggFunc::XBAR:  row[ci] = merged.first_val[ci]; break;
+            case AggFunc::NONE:  row[ci] = 0; break;
+        }
+    }
+
+    result.rows.push_back(std::move(row));
+    result.rows_scanned = merged.rows_scanned;
+    return result;
+}
+
+// ============================================================================
+// 병렬 GROUP BY 집계
+// ============================================================================
+// 전략:
+//   1. 파티션을 N청크로 분배
+//   2. 각 스레드가 청크에 대해 로컬 group map 생성
+//   3. 메인 스레드가 group map 머지
+// ============================================================================
+QueryResultSet QueryExecutor::exec_group_agg_parallel(
+    const SelectStmt& stmt,
+    const std::vector<Partition*>& partitions)
+{
+    using namespace apex::execution;
+
+    size_t n_threads = pool_raw_->num_threads();
+    ParallelScanExecutor pse(*pool_raw_);
+
+    size_t total_rows = estimate_total_rows(partitions);
+    ParallelMode mode = ParallelScanExecutor::select_mode(
+        partitions.size(), total_rows, n_threads, par_opts_.row_threshold);
+
+    if (mode == ParallelMode::SERIAL) {
+        return exec_group_agg(stmt, partitions);
+    }
+
+    const auto& gb = stmt.group_by.value();
+    const std::string& group_col = gb.columns[0];
+    int64_t group_xbar_bucket = gb.xbar_buckets.empty() ? 0 : gb.xbar_buckets[0];
+    bool is_symbol_group = (group_col == "symbol" && group_xbar_bucket == 0);
+
+    int64_t ts_lo = INT64_MIN, ts_hi = INT64_MAX;
+    bool use_ts_index = extract_time_range(stmt, ts_lo, ts_hi);
+
+    size_t ncols = stmt.columns.size();
+
+    struct GroupState {
+        int64_t  sum     = 0;
+        int64_t  count   = 0;
+        double   avg_sum = 0.0;
+        int64_t  minv    = INT64_MAX;
+        int64_t  maxv    = INT64_MIN;
+        double   vwap_pv = 0.0;
+        int64_t  vwap_v  = 0;
+        int64_t  first_val = 0;
+        int64_t  last_val  = 0;
+        bool     has_first = false;
+    };
+
+    using GroupMap = std::unordered_map<int64_t, std::vector<GroupState>>;
+
+    struct PartialGroup {
+        GroupMap map;
+        size_t rows_scanned = 0;
+    };
+
+    auto init_partial = []() -> PartialGroup { return {}; };
+
+    auto chunks = ParallelScanExecutor::make_partition_chunks(
+        partitions,
+        (mode == ParallelMode::PARTITION) ? n_threads : 1);
+
+    auto partials = pse.parallel_for_chunks<PartialGroup>(
+        chunks,
+        init_partial,
+        [&](const std::vector<Partition*>& chunk, size_t /*tid*/, PartialGroup& pg) {
+            pg.map.reserve(1024);
+            for (auto* part : chunk) {
+                size_t n = part->num_rows();
+                std::vector<uint32_t> sel_indices;
+
+                if (use_ts_index) {
+                    if (!part->overlaps_time_range(ts_lo, ts_hi)) continue;
+                    auto [r_begin, r_end] = part->timestamp_range(ts_lo, ts_hi);
+                    pg.rows_scanned += r_end - r_begin;
+                    sel_indices = eval_where_ranged(stmt, *part, r_begin, r_end);
+                } else {
+                    pg.rows_scanned += n;
+                    sel_indices = eval_where(stmt, *part, n);
+                }
+
+                // GROUP KEY 데이터
+                const int64_t* gdata = nullptr;
+                int64_t symbol_gkey = 0;
+                if (is_symbol_group) {
+                    symbol_gkey = static_cast<int64_t>(part->key().symbol_id);
+                } else {
+                    gdata = get_col_data(*part, group_col);
+                    if (!gdata) continue;
+                }
+
+                for (auto idx : sel_indices) {
+                    int64_t gkey = is_symbol_group ? symbol_gkey : gdata[idx];
+                    if (group_xbar_bucket > 0) {
+                        gkey = (gkey / group_xbar_bucket) * group_xbar_bucket;
+                    }
+
+                    auto& states = pg.map[gkey];
+                    if (states.empty()) states.resize(ncols);
+
+                    for (size_t ci = 0; ci < ncols; ++ci) {
+                        const auto& col = stmt.columns[ci];
+                        if (col.agg == AggFunc::NONE) continue;
+                        auto& gs = states[ci];
+                        const int64_t* data = get_col_data(*part, col.column);
+
+                        switch (col.agg) {
+                            case AggFunc::COUNT: gs.count++; break;
+                            case AggFunc::SUM:
+                                if (data) gs.sum += data[idx]; break;
+                            case AggFunc::AVG:
+                                if (data) { gs.avg_sum += data[idx]; gs.count++; } break;
+                            case AggFunc::MIN:
+                                if (data) gs.minv = std::min(gs.minv, data[idx]); break;
+                            case AggFunc::MAX:
+                                if (data) gs.maxv = std::max(gs.maxv, data[idx]); break;
+                            case AggFunc::FIRST:
+                            case AggFunc::LAST:
+                                if (data) {
+                                    if (!gs.has_first) {
+                                        gs.first_val = data[idx];
+                                        gs.has_first = true;
+                                    }
+                                    gs.last_val = data[idx];
+                                }
+                                break;
+                            case AggFunc::XBAR:
+                                if (data && !gs.has_first) {
+                                    int64_t b = col.xbar_bucket;
+                                    gs.first_val = b > 0
+                                        ? (data[idx] / b) * b : data[idx];
+                                    gs.has_first = true;
+                                }
+                                break;
+                            case AggFunc::VWAP: {
+                                const int64_t* vd = get_col_data(*part, col.agg_arg2);
+                                if (data && vd) {
+                                    gs.vwap_pv += static_cast<double>(data[idx])
+                                                * static_cast<double>(vd[idx]);
+                                    gs.vwap_v  += vd[idx];
+                                }
+                                break;
+                            }
+                            case AggFunc::NONE: break;
+                        }
+                    }
+                }
+            }
+        }
+    );
+
+    // ── 로컬 GroupMap 머지 ──
+    GroupMap merged;
+    size_t rows_scanned = 0;
+    merged.reserve(1024);
+
+    for (auto& pg : partials) {
+        rows_scanned += pg.rows_scanned;
+        for (auto& [gkey, src_states] : pg.map) {
+            auto& dst_states = merged[gkey];
+            if (dst_states.empty()) {
+                dst_states = src_states;
+                continue;
+            }
+            for (size_t ci = 0; ci < ncols; ++ci) {
+                const auto& col = stmt.columns[ci];
+                if (col.agg == AggFunc::NONE) continue;
+                auto& dst = dst_states[ci];
+                const auto& src = src_states[ci];
+                switch (col.agg) {
+                    case AggFunc::COUNT: dst.count   += src.count; break;
+                    case AggFunc::SUM:   dst.sum     += src.sum;   break;
+                    case AggFunc::AVG:   dst.avg_sum += src.avg_sum; dst.count += src.count; break;
+                    case AggFunc::MIN:   dst.minv     = std::min(dst.minv, src.minv); break;
+                    case AggFunc::MAX:   dst.maxv     = std::max(dst.maxv, src.maxv); break;
+                    case AggFunc::VWAP:  dst.vwap_pv += src.vwap_pv; dst.vwap_v += src.vwap_v; break;
+                    case AggFunc::FIRST:
+                    case AggFunc::LAST:
+                        if (!dst.has_first && src.has_first) {
+                            dst.first_val = src.first_val;
+                            dst.has_first = true;
+                        }
+                        if (src.has_first) dst.last_val = src.last_val;
+                        break;
+                    case AggFunc::XBAR:
+                        if (!dst.has_first && src.has_first) {
+                            dst.first_val = src.first_val;
+                            dst.has_first = true;
+                        }
+                        break;
+                    case AggFunc::NONE: break;
+                }
+            }
+        }
+    }
+
+    // ── 결과 조립 ──
+    QueryResultSet result;
+    result.column_names.push_back(group_col);
+    result.column_types.push_back(ColumnType::INT64);
+    for (size_t ci = 0; ci < ncols; ++ci) {
+        const auto& col = stmt.columns[ci];
+        if (col.agg == AggFunc::NONE) continue;
+        std::string name = col.alias.empty()
+            ? (col.column.empty() ? "*" : col.column) : col.alias;
+        result.column_names.push_back(name);
+        result.column_types.push_back(ColumnType::INT64);
+    }
+
+    for (auto& [gkey, states] : merged) {
+        std::vector<int64_t> row;
+        row.push_back(gkey);
+        for (size_t ci = 0; ci < ncols; ++ci) {
+            const auto& col = stmt.columns[ci];
+            if (col.agg == AggFunc::NONE) continue;
+            const auto& gs = states[ci];
+            switch (col.agg) {
+                case AggFunc::COUNT: row.push_back(gs.count); break;
+                case AggFunc::SUM:   row.push_back(gs.sum);   break;
+                case AggFunc::AVG:
+                    row.push_back(gs.count > 0
+                        ? static_cast<int64_t>(gs.avg_sum / gs.count) : 0); break;
+                case AggFunc::MIN:
+                    row.push_back(gs.minv == INT64_MAX ? 0 : gs.minv); break;
+                case AggFunc::MAX:
+                    row.push_back(gs.maxv == INT64_MIN ? 0 : gs.maxv); break;
+                case AggFunc::VWAP:
+                    row.push_back(gs.vwap_v > 0
+                        ? static_cast<int64_t>(gs.vwap_pv / gs.vwap_v) : 0); break;
+                case AggFunc::FIRST: row.push_back(gs.first_val); break;
+                case AggFunc::LAST:  row.push_back(gs.last_val);  break;
+                case AggFunc::XBAR:  row.push_back(gs.first_val); break;
+                case AggFunc::NONE: break;
+            }
+        }
+        result.rows.push_back(std::move(row));
+    }
+
+    result.rows_scanned = rows_scanned;
+
+    apply_order_by(result, stmt);
+    if (!stmt.order_by.has_value() &&
+        stmt.limit.has_value() && result.rows.size() > (size_t)stmt.limit.value()) {
+        result.rows.resize(stmt.limit.value());
+    }
+
+    return result;
+}
 
 } // namespace apex::sql
