@@ -31,7 +31,7 @@ bool NASDAQITCHParser::parse_packet(const uint8_t* data, size_t len) {
 
     msg_type_ = static_cast<ITCHMessageType>(header.type);
     current_message_ = data + sizeof(ITCHMessageHeader);
-    current_message_len_ = header.length - 1;  // type 바이트 제외
+    current_message_len_ = len - sizeof(ITCHMessageHeader);
 
     ++message_count_;
     return true;

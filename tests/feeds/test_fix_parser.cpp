@@ -179,7 +179,7 @@ TEST(FIXMessageBuilderTest, AddFields) {
 
     builder.add_field(55, "AAPL");  // Symbol
     builder.add_field(44, 150.50);  // Price
-    builder.add_field(38, 100);     // OrderQty
+    builder.add_field(38, int64_t{100});     // OrderQty
 
     std::string msg = builder.build('D');  // New Order Single
 

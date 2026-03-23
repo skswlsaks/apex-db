@@ -21,6 +21,11 @@ bool FIXParser::parse(const char* msg, size_t len) {
     fields_.clear();
     msg_type_ = FIXMsgType::UNKNOWN;
 
+    if (!msg || len == 0) {
+        ++error_count_;
+        return false;
+    }
+
     // FIX 메시지는 SOH (0x01)로 필드 구분
     constexpr char SOH = 0x01;
     const char* ptr = msg;
@@ -345,8 +350,8 @@ std::string FIXMessageBuilder::build(char msg_type) {
 }
 
 std::string FIXMessageBuilder::build_logon(int heartbeat_interval) {
-    add_field(98, 0);  // EncryptMethod (0=None)
-    add_field(108, heartbeat_interval);  // HeartBtInt
+    add_field(98, int64_t{0});  // EncryptMethod (0=None)
+    add_field(108, int64_t{heartbeat_interval});  // HeartBtInt
     return build('A');
 }
 

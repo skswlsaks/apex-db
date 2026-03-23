@@ -338,7 +338,4 @@ TEST(ITCHParserPerformanceTest, ParseSpeed) {
     EXPECT_LT(ns_per_msg, 500.0);
 }
 
-int main(int argc, char** argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+// main provided by test_fix_parser.cpp
