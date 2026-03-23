@@ -9,7 +9,7 @@
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-blue)
 ![LLVM 19](https://img.shields.io/badge/LLVM-19-orange)
 ![Highway SIMD](https://img.shields.io/badge/SIMD-Highway-green)
-![Tests](https://img.shields.io/badge/tests-466%2B%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-565%2B%20passing-brightgreen)
 ![kdb+ replacement](https://img.shields.io/badge/kdb%2B%20replacement-95%25-success)
 
 </div>
@@ -33,7 +33,8 @@ APEX-DB is an ultra-low latency in-memory database designed for HFT, combining
 - ✅ xbar (time bar aggregation) — 5-min/1-hour OHLCV candlestick charts
 - ✅ EMA (Exponential Moving Average) — technical indicators
 - ✅ Window JOIN (wj) — time window join (HFT quote analysis)
-- ✅ LEFT JOIN, ASOF JOIN, Hash JOIN
+- ✅ LEFT JOIN, ASOF JOIN, Hash JOIN, RIGHT JOIN, FULL OUTER JOIN
+- ✅ UNION JOIN (uj), PLUS JOIN (pj), AJ0 (left-columns-only ASOF)
 - ✅ DELTA/RATIO (row-to-row difference/ratio)
 - ✅ FIRST/LAST (OHLC)
 
@@ -82,23 +83,29 @@ APEX-DB is an ultra-low latency in-memory database designed for HFT, combining
 │  Recursive descent parser · AST executor               │
 ├────────────────────────────────────────────────────────┤
 │  Layer 3: Execution Engine                              │
-│  Highway SIMD · LLVM JIT · JOIN (ASOF/Hash/LEFT)      │
+│  Highway SIMD · LLVM JIT · JOIN (ASOF/Hash/LEFT/RIGHT/FULL) │
 │  Window Functions (EMA/DELTA/RATIO/SUM/LAG/LEAD)      │
 │  Financial functions (xbar/FIRST/LAST/Window JOIN)    │
+│  String functions (SUBSTR) · uj/pj/aj0 (kdb+ JOINs)  │
 │  QueryScheduler (Local/Distributed DI pattern)        │
+│  Parallel Scan (Partition/CHUNKED) · Resource Isolation│
 ├────────────────────────────────────────────────────────┤
 │  Layer 2: Ingestion (Tick Plant)                        │
 │  MPMC Ring Buffer · UCX/RDMA · WAL                    │
+│  Multi-threaded Drain · Direct-to-Storage Bypass      │
 │  Feed Handlers (FIX, NASDAQ ITCH, Binance)            │
 ├────────────────────────────────────────────────────────┤
 │  Layer 1: Storage Engine (DMMT)                         │
-│  Arena Allocator · Column Store · HDB (LZ4)           │
+│  Arena Allocator · Column Store · HDB (LZ4/Parquet)   │
+│  Parquet Reader/Writer · S3 Sink                      │
 ├────────────────────────────────────────────────────────┤
 │  Migration Toolkit                                      │
 │  kdb+ · ClickHouse · DuckDB · TimescaleDB             │
 ├────────────────────────────────────────────────────────┤
 │  Layer 0: Distributed Cluster                           │
 │  Transport (UCX→CXL) · Consistent Hash · Health       │
+│  Replication (RF=2) · Auto Failover · Coordinator HA  │
+│  ComputeNode · SnapshotCoordinator · WAL Replicator   │
 └────────────────────────────────────────────────────────┘
 ```
 
@@ -176,6 +183,25 @@ SELECT t.price, t.volume, r.risk_score
 FROM trades t
 LEFT JOIN risk_factors r ON t.symbol = r.symbol
 
+-- FULL OUTER JOIN
+SELECT t.price, r.price
+FROM trades t
+FULL OUTER JOIN quotes r ON t.symbol = r.symbol
+
+-- UNION JOIN (kdb+ uj — merge columns, concatenate rows)
+SELECT * FROM trades t UNION JOIN quotes q
+
+-- PLUS JOIN (kdb+ pj — additive join)
+SELECT * FROM trades t
+PLUS JOIN adjustments a ON t.symbol = a.symbol
+
+-- AJ0 (left-columns-only ASOF JOIN)
+SELECT t.price, t.volume, q.bid FROM trades t
+AJ0 JOIN quotes q ON t.symbol = q.symbol AND t.timestamp >= q.timestamp
+
+-- SUBSTR (string manipulation on int64 columns)
+SELECT SUBSTR(price, 1, 2) AS price_prefix FROM trades WHERE symbol = 1
+
 -- Window functions
 SELECT symbol, price,
        AVG(price) OVER (PARTITION BY symbol ROWS 20 PRECEDING) AS ma20,
@@ -244,21 +270,24 @@ python3 -m pytest ../tests/test_python.py -v
 ```
 apex-db/
 ├── include/apex/
-│   ├── storage/        # Arena, ColumnStore, PartitionManager, HDB
+│   ├── storage/        # Arena, ColumnStore, PartitionManager, HDB, ParquetReader/Writer
 │   ├── ingestion/      # RingBuffer, TickPlant, WAL
 │   ├── execution/      # VectorizedEngine, JIT, JOIN, WindowFunctions, QueryScheduler
+│   │                   # ParallelScan (Partition/CHUNKED), ResourceIsolation
 │   ├── sql/            # Tokenizer, Parser, AST, Executor (+ CancellationToken)
 │   ├── server/         # HttpServer (ClickHouse compatible, Admin API, query timeout)
 │   ├── auth/           # RBAC, ApiKeyStore, JwtValidator, AuthManager, RateLimiter,
 │   │                   # AuditBuffer, CancellationToken, QueryTracker, SecretsProvider
 │   ├── feeds/          # FIX, NASDAQ ITCH, Binance feed handlers
 │   ├── migration/      # kdb+/ClickHouse/DuckDB/TimescaleDB migrators
-│   ├── core/           # ApexPipeline (E2E integration)
-│   ├── cluster/        # Transport, PartitionRouter, HealthMonitor
+│   ├── core/           # ApexPipeline (E2E integration, multi-threaded drain)
+│   ├── cluster/        # Transport, PartitionRouter, HealthMonitor, QueryCoordinator
+│   │                   # WalReplicator, FailoverManager, CoordinatorHA
+│   │                   # SnapshotCoordinator, ComputeNode, PartitionMigrator
 │   └── transpiler/     # Python binding (pybind11)
 ├── src/                # Implementation
 ├── tests/
-│   ├── unit/           # Google Test (383 tests — includes 69 auth/security tests)
+│   ├── unit/           # Google Test (565+ tests)
 │   ├── feeds/          # Feed handler tests (37 tests)
 │   ├── migration/      # Migration toolkit tests (70 tests)
 │   ├── python/         # Python ecosystem tests (208 tests)

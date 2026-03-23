@@ -454,6 +454,74 @@ TEST(HashJoin, LeftJoin_PartialMatch) {
     EXPECT_EQ(match_map[2], -1LL);  // 왼쪽 idx 2 (value=3): no match → NULL
 }
 
+TEST(HashJoin, RightJoin_NoMatch) {
+    // RIGHT JOIN: left=[1,2], right=[3,4] — 매칭 없음 → right rows with left NULL
+    ArenaAllocator al(ArenaConfig{.total_size = 1 << 20, .use_hugepages = false, .numa_node = -1});
+    ArenaAllocator ar(ArenaConfig{.total_size = 1 << 20, .use_hugepages = false, .numa_node = -1});
+
+    ColumnVector lk("id", ColumnType::INT64, al);
+    ColumnVector rk("id", ColumnType::INT64, ar);
+
+    lk.append<int64_t>(1); lk.append<int64_t>(2);
+    rk.append<int64_t>(3); rk.append<int64_t>(4);
+
+    HashJoinOperator hj(JoinType::RIGHT);
+    auto result = hj.execute(lk, rk);
+
+    // RIGHT JOIN: right rows always included (2 rows), left-side NULL
+    EXPECT_EQ(result.match_count, 2u);
+    EXPECT_EQ(result.left_indices[0], -1LL);   // left NULL sentinel
+    EXPECT_EQ(result.right_indices[0], 0LL);
+    EXPECT_EQ(result.left_indices[1], -1LL);
+    EXPECT_EQ(result.right_indices[1], 1LL);
+}
+
+TEST(HashJoin, RightJoin_PartialMatch) {
+    // RIGHT JOIN: left=[1,3], right=[1,2,3] — right row 2 has no left match
+    ArenaAllocator al(ArenaConfig{.total_size = 1 << 20, .use_hugepages = false, .numa_node = -1});
+    ArenaAllocator ar(ArenaConfig{.total_size = 1 << 20, .use_hugepages = false, .numa_node = -1});
+
+    ColumnVector lk("id", ColumnType::INT64, al);
+    ColumnVector rk("id", ColumnType::INT64, ar);
+
+    lk.append<int64_t>(1); lk.append<int64_t>(3);
+    rk.append<int64_t>(1); rk.append<int64_t>(2); rk.append<int64_t>(3);
+
+    HashJoinOperator hj(JoinType::RIGHT);
+    auto result = hj.execute(lk, rk);
+
+    // RIGHT JOIN: 3 rows (all right rows present)
+    EXPECT_EQ(result.match_count, 3u);
+
+    // Build right_idx → left_idx map
+    std::unordered_map<int64_t, int64_t> rmap;
+    for (size_t i = 0; i < result.match_count; ++i)
+        rmap[result.right_indices[i]] = result.left_indices[i];
+
+    EXPECT_GE(rmap[0], 0LL);   // right idx 0 (value=1) → left match
+    EXPECT_EQ(rmap[1], -1LL);  // right idx 1 (value=2) → left NULL
+    EXPECT_GE(rmap[2], 0LL);   // right idx 2 (value=3) → left match
+}
+
+TEST(HashJoin, RightJoin_AllMatch) {
+    // RIGHT JOIN 전부 매칭 시 INNER JOIN과 동일 결과
+    ArenaAllocator al(ArenaConfig{.total_size = 1 << 20, .use_hugepages = false, .numa_node = -1});
+    ArenaAllocator ar(ArenaConfig{.total_size = 1 << 20, .use_hugepages = false, .numa_node = -1});
+
+    ColumnVector lk("id", ColumnType::INT64, al);
+    ColumnVector rk("id", ColumnType::INT64, ar);
+
+    lk.append<int64_t>(1); lk.append<int64_t>(2); lk.append<int64_t>(3);
+    rk.append<int64_t>(1); rk.append<int64_t>(2); rk.append<int64_t>(3);
+
+    HashJoinOperator hj(JoinType::RIGHT);
+    auto result = hj.execute(lk, rk);
+
+    EXPECT_EQ(result.match_count, 3u);
+    for (size_t i = 0; i < result.match_count; ++i)
+        EXPECT_GE(result.left_indices[i], 0LL);  // no NULLs when all match
+}
+
 TEST(HashJoin, InnerJoin_NoMatch) {
     // INNER JOIN은 이전과 동일 (매칭 없으면 제외)
     ArenaAllocator al(ArenaConfig{.total_size = 1 << 20, .use_hugepages = false, .numa_node = -1});

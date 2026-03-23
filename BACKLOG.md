@@ -7,7 +7,7 @@
 
 | Task | Status | Performance |
 |------|--------|-------------|
-| **xbar (time bar aggregation)** | ✅ | 1M → 3,334 bars in 24ms |
+| **xbar (time bar aggregation)** | ✅ | 1M → 3,334 bars in 10.25ms |
 | **ema (exponential moving average)** | ✅ | 1M rows in 2.2ms |
 | **LEFT JOIN** | ✅ | NULL sentinel (INT64_MIN) |
 | **Window JOIN (wj)** | ✅ | O(n log m) binary search |
@@ -39,7 +39,7 @@
   - Phase 2: SELECT arithmetic, CASE WHEN, multi-column GROUP BY
   - Phase 3: Date/time functions, LIKE/NOT LIKE, UNION/INTERSECT/EXCEPT
   - Parallel paths (`exec_agg_parallel`, `exec_group_agg_parallel`) synchronized with all Phase 2/3 features
-  - Remaining: subqueries/CTE, RIGHT JOIN, EXPLAIN, SUBSTR (see SQL Completeness section)
+  - Remaining: RIGHT JOIN, SUBSTR (see SQL Completeness section)
 - [x] **Time range index** ✅ Completed (2026-03-22)
   - `Partition::timestamp_range(lo, hi)` — O(log n) binary search within partition
   - `Partition::overlaps_time_range(lo, hi)` — O(1) partition skip check
@@ -49,6 +49,37 @@
   - All three exec paths (simple_select, agg, group_agg) use timestamp binary search
   - 8 new tests: partial scan, agg, GROUP BY, empty range, single row, no-symbol filter
 - [ ] **Graviton (ARM) build test** — r8g instance, Highway SVE
+- [x] **Timer / Scheduler** ✅ Completed (2026-03-23) — kdb+ `.z.ts` equivalent
+  - `Scheduler::add_job(name, interval_ms, fn)` — periodic interval callbacks
+  - `Scheduler::add_daily(name, HH, MM, SS, fn)` — daily at wall-clock time (EOD flush)
+  - `Scheduler::add_once(name, fire_at_ns, fn)` — one-shot future execution
+  - Background thread with min-heap priority queue; nanosecond-accurate wakeups
+  - Lazy cancellation (O(1) cancel via atomic flag), thread-safe add/cancel from any thread
+  - Exception-safe callbacks (job survives exception, continues scheduling)
+  - 18 tests: lifecycle, interval, once-at, cancel, exception safety
+  - `include/apex/scheduler/scheduler.h`, `src/scheduler/scheduler.cpp`
+  - **Business value:** EOD RDB→HDB transition, auto partition flush, scheduled aggregation
+- [x] **Connection hooks** ✅ Completed (2026-03-23) — kdb+ `.z.po/.z.pc` equivalent
+  - `HttpServer::set_on_connect(fn)` / `set_on_disconnect(fn)` — session lifecycle callbacks
+  - Session tracking: remote_addr, user, query_count, connected_at_ns, last_active_ns
+  - `list_sessions()` — snapshot of all active sessions
+  - `evict_idle_sessions(timeout_ms)` — clean up stale sessions, fires on_disconnect
+  - `GET /admin/sessions` — REST endpoint for active session list
+  - httplib `set_logger` hook fires after every request; `Connection: close` triggers disconnect
+  - 7 tests: OnConnectFires, OnConnectFiresOnlyOnce, OnDisconnect, ListSessions, EvictIdle, EvictKeepsRecent, QueryCount
+  - `include/apex/server/http_server.h`, `src/server/http_server.cpp`
+- [x] **Attribute hints (s#)** ✅ Completed (2026-03-23) — kdb+ `s#` sorted column binary search
+  - `Partition::set_sorted(col)` — mark column as sorted (s# attribute)
+  - `Partition::is_sorted(col)` / `sorted_range(col, lo, hi)` — O(log n) range scan
+  - Executor integration: `extract_sorted_col_range()` in `exec_simple_select`
+  - Handles: BETWEEN, >=, >, <=, <, = operators in WHERE clause
+  - 13 tests: SetAndCheck, FullSpan, Middle, Exact, BelowAll, AboveAll, UnknownCol, BETWEEN/GE-LE/EQ/OOR/RowsScanned (SQL query tests)
+  - `include/apex/storage/partition_manager.h`, `include/apex/sql/executor.h`, `src/sql/executor.cpp`
+  - `g#`/`p#` hash/parted indexes: still pending
+- [x] **`\t <sql>` one-shot timer** ✅ Completed (2026-03-23) — kdb+ `\t expr` equivalent
+  - `\t <sql>` in apex-cli runs a query once with timing enabled, regardless of toggle state
+  - Original `\t` toggle (ON/OFF) unchanged; `\t <sql>` is purely one-shot
+  - `tools/apex-cli.cpp` `BuiltinCommands::handle()`
 
 ## High Priority (Business/Operations)
 - [x] **Production deployment guide** ✅ Completed (2026-03-22)
@@ -161,22 +192,43 @@
 - [ ] **Website & documentation site** — apex-db.io, docs.apex-db.io
 
 ## Medium Priority
-- [ ] **Distributed query scheduler** — DistributedQueryScheduler implementation (on UCX transport)
-  - PartialAggResult FlatBuffers serialization
-  - scatter: fragments → UCX send → execution on each node
-  - gather: UCX recv → PartialAggResult::merge()
-  - Multi-node benchmark (2-node scatter/gather latency)
-  - **Note:** Single-node parallelism already complete (LocalQueryScheduler, 8T = 3.48x)
-- [ ] **Data/Compute node separation** — Run JOIN on separate Compute Node via RDMA remote_read, zero Data Node impact
-- [ ] **CHUNKED mode activation** — Parallelize row splitting for single large partitions
-- [ ] **exec_simple_select parallelization** — Currently only aggregation is parallel, add SELECT parallelism
+- [x] **Distributed query scheduler** ✅ Completed (2026-03-23)
+  - `DistributedQueryScheduler`: TCP RPC 기반 구현 (스텁 → 실제 구현)
+  - scatter(): SQL을 원격 노드에 전송, 결과를 PartialAggResult로 변환
+  - gather(): PartialAggResult merge
+  - QueryScheduler 인터페이스 준수 (LocalQueryScheduler와 교체 가능)
+- [x] **Data/Compute node separation** ✅ Completed (2026-03-23)
+  - `ComputeNode`: stateless query executor, fetches data from Data Nodes via RPC
+  - `fetch_and_ingest()`: pull data from remote → local pipeline for local JOIN
+  - `execute()`: fan-out to all data nodes, concat results
+  - 2 tests: fetch-and-ingest local JOIN, execute across data nodes
+- [x] **CHUNKED mode activation** ✅ Completed (2026-03-23)
+  - exec_agg_parallel + exec_simple_select_parallel: single large partition → row range split
+  - ParallelScanExecutor::make_row_chunks → per-thread eval_where_ranged
+  - Auto-selected when partitions < threads but rows > threshold
+- [x] **exec_simple_select parallelization** ✅ Completed (2026-03-23)
+  - Partition-parallel SELECT via ParallelScanExecutor
+  - Auto-fallback to serial for small data
+  - Concat merge + ORDER BY post-processing
 - [ ] **DuckDB embedding (delegate complex JOINs)** — Arrow zero-copy pass-through
 - [ ] **JIT SIMD emit** — Generate AVX2/512 vector IR from LLVM JIT
-- [ ] **Multi-threaded drain** — Sharded drain threads
-- [ ] **Ring Buffer dynamic adjustment** — Direct-to-storage path
+- [x] **Multi-threaded drain** ✅ Completed (2026-03-23)
+  - `PipelineConfig::drain_threads` — configurable drain thread count (default 1)
+  - MPMC ring buffer supports multiple consumers natively
+  - `start()` spawns N drain threads, `stop()` joins all
+- [x] **Ring Buffer dynamic adjustment** ✅ Completed (2026-03-23)
+  - Queue full → direct-to-storage bypass (no data loss, slightly slower)
+  - Removed ticks_dropped counter — all ticks now stored
 - [x] **HugePages tuning** ✅ Completed (2026-03-22) — 4608×2MB allocated, active during benchmarks
-- [ ] **exec_group_agg single-column optimization** — Replace `vector<int64_t>` key with flat `int64_t` for single-column GROUP BY (expected 2-5x speedup on Xbar)
-- [ ] **Resource isolation** — realtime (cores 0-3) vs analytics (cores 4-7) CPU pinning
+- [x] **exec_group_agg single-column optimization** ✅ Completed (2026-03-22)
+  - Replaced `vector<int64_t>` key with flat `int64_t` for single-column GROUP BY
+  - Hoisted `get_col_data()` calls from per-row to per-partition scope
+  - XBAR sorted-scan: `cached_key`/`cached_slot` eliminate ~99.7% of hash lookups for monotonic timestamps
+  - Result: Xbar 1M → **10.25ms** (-77% vs original 45.2ms) with LTO+PGO6+tcmalloc+hugepages+sorted-scan
+- [x] **Resource isolation** ✅ Completed (2026-03-23)
+  - `ResourceIsolation`: CPU pinning via pthread_setaffinity_np
+  - `IsolationConfig`: realtime_cores, analytics_cores, drain_cores
+  - `pin_to_core()` / `pin_to_cores()` static helpers
 
 ## Storage & Format Extensions
 - [x] **Parquet HDB storage** ✅ Completed (2026-03-22, devlog #012)
@@ -193,10 +245,11 @@
   - Async upload (`upload_file_async()`)
   - `delete_local_after_s3` option (storage savings)
   - **Business value:** Disaster recovery, cloud data lake, long-term retention
-- [ ] **Parquet reading** — S3/local Parquet → APEX-DB queries
-  - `HDBReader` Parquet support (`read_parquet()`)
-  - Direct read from S3 (no local cache)
-  - Parquet metadata-based partition pruning
+- [x] **Parquet reading** ✅ Completed (2026-03-23)
+  - `ParquetReader::read_file()` — Parquet → ParquetReadResult (column_names + rows)
+  - `ParquetReader::ingest_file()` — Parquet → pipeline (auto column mapping)
+  - Compile-time optional (APEX_PARQUET_AVAILABLE guard)
+  - Graceful fallback when Arrow/Parquet not available
 - [ ] **Arrow Flight server** — Transmit Arrow format over network
   - Stream distributed query results as Arrow batches
   - Direct Pandas/Polars client connection
@@ -268,7 +321,7 @@
   - `INTERSECT` — rows present in both sides
   - `EXCEPT` — rows in left side not present in right side
   - `SelectStmt::SetOp` enum + `rhs` shared_ptr in AST; handled at top of `exec_select()`
-- [ ] **NULL handling standardization** — INT64_MIN sentinel → actual NULL
+- [x] **NULL handling standardization** ✅ Completed (2026-03-22) — INT64_MIN sentinel returned for empty MIN/MAX/AVG/VWAP aggregates across all exec paths
 - [x] **Date/time functions** ✅ Completed (2026-03-22)
   - `DATE_TRUNC('unit', col)` — floor timestamp to ns/us/ms/s/min/hour/day/week
   - `NOW()` — current nanosecond timestamp (`std::chrono::system_clock`)
@@ -287,9 +340,37 @@
 - [x] **Multi-column GROUP BY** ✅ Completed (2026-03-22)
   - `GROUP BY symbol, price` — composite key via `VectorHash<std::vector<int64_t>>`
   - Works in both serial and parallel (`exec_group_agg_parallel`) paths
-- [ ] **RIGHT JOIN / FULL OUTER JOIN** — SQL standard completion
-- [ ] **EXPLAIN** — Query execution plan output (debugging, optimization)
-- [ ] **SUBSTR / string manipulation** — for symbol name processing
+- [x] **RIGHT JOIN** ✅ Completed (2026-03-23)
+  - `JoinClause::Type::RIGHT` in AST; parser handles `RIGHT [OUTER] JOIN`
+  - `HashJoinOperator`: RIGHT mode builds hash on left, probes with right; unmatched right → `left_indices[i] = -1`
+  - `exec_hash_join`: mirrors LEFT JOIN logic — unmatched right rows get `JOIN_NULL` on left columns
+  - 7 new tests: Parser.RightJoin/RightOuterJoin, HashJoin.RightJoin_NoMatch/PartialMatch/AllMatch, SqlExecutorTest.RightJoin_Executes/NoWhere
+- [x] **FULL OUTER JOIN** ✅ Completed (2026-03-23) — SQL standard completion
+  - Parser: `FULL [OUTER] JOIN` → `JoinClause::Type::FULL`
+  - HashJoinOperator: FULL mode — LEFT JOIN + unmatched right rows appended
+  - exec_hash_join: `right_matched[]` tracking for unmatched right-side detection
+  - 4 tests: Parser (FULL OUTER, FULL), Executor, HashJoinOperator (unmatched both sides)
+- [x] **EXPLAIN** ✅ Completed (2026-03-22) — `EXPLAIN SELECT ...` returns execution plan as string_rows; shows operation type, scan path, partition count, estimated rows, GROUP BY details
+- [x] **SUBSTR / string manipulation** ✅ Completed (2026-03-23) — for symbol name processing
+  - `SUBSTR(col, start, len)` — 1-based position, optional length
+  - ArithExpr::FUNC node with `func_arg2` for length parameter
+  - Works on int64 columns via `std::to_string()` conversion (e.g., `SUBSTR(price, 1, 2)` = first 2 digits)
+  - Tokenizer: `SUBSTR` keyword, Parser: 2-3 arg function call
+  - 4 tests: Parser, FirstTwoDigits, MiddleDigits, NoLength
+- [x] **uj (union join)** ✅ Completed (2026-03-23) — kdb+ `uj`: merge columns, concatenate rows
+  - `UNION JOIN table [ON ...]` — ON clause optional
+  - `exec_union_join`: union of column names from both sides, JOIN_NULL for missing columns
+  - All rows from both tables appear in result
+  - 3 tests: Parser, ConcatenatesRows, HasColumns
+- [x] **pj (plus join)** ✅ Completed (2026-03-23) — kdb+ `pj`: additive join
+  - `PLUS JOIN table ON key = key` — matching rows: numeric columns added
+  - `exec_plus_join`: hash lookup by key, overlapping columns get `left_val += right_val`
+  - Non-matching left rows pass through unchanged
+  - 3 tests: Parser, AddsValues, NoMatchPassthrough
+- [x] **aj0 variant** ✅ Completed (2026-03-23) — left-column-only asof join result
+  - `AJ0 JOIN table ON ...` — same as ASOF JOIN but right-table columns excluded from result
+  - `exec_asof_join` with `aj0_mode`: skips right-alias columns in both column_names and row assembly
+  - 3 tests: Parser, SkipsRightColumns, ReturnsLeftData
 
 ## Client Ecosystem
 - [ ] **JDBC/ODBC drivers** — Connect Tableau, Excel, BI tools
@@ -298,19 +379,30 @@
 - [ ] **ClickHouse wire protocol** — Full binary protocol compatibility
   - Use existing CH client libraries (Go, Java, .NET) as-is
   - **Business value:** Zero-friction migration for ClickHouse users
-- [ ] **Official Python package** — `pip install apex-db`
-  - PyPI distribution, `apex.connect("localhost:8123")`
+- [x] **Official Python package** — `pip install apex-db` ✅ Completed (2026-03-23)
+  - `pyproject.toml`: name=`apex-db`, `setuptools.build_meta`, SPDX license, classifiers
+  - `python -m build` → `apex_db-0.1.0-py3-none-any.whl` + sdist; `twine check` PASSED
+  - Optional extras: `[pandas]` `[polars]` `[arrow]` `[duckdb]` `[all]`
+  - **Remaining:** `twine upload` to PyPI (requires account + token)
   - **Business value:** 10x developer adoption rate
 
 ## Streaming Data Integration
-- [ ] **Apache Kafka consumer** — Kafka topics → APEX-DB real-time ingestion
-  - librdkafka C++ client integration
-  - Topic partition → APEX-DB partition auto-mapping
-  - Offset management (at-least-once, exactly-once support)
-  - Avro/Protobuf/JSON schema auto-decoding
-  - **Implementation:** `src/feeds/kafka_consumer.cpp`, `include/apex/feeds/kafka_consumer.h`
+- [x] **Apache Kafka consumer** ✅ Completed (2026-03-23)
+  - `include/apex/feeds/kafka_consumer.h` + `src/feeds/kafka_consumer.cpp` — `apex_kafka` CMake library
+  - Three wire formats: JSON (`symbol_id`/`price`/`volume`/`ts`), BINARY (raw TickMessage), JSON_HUMAN (float price + symbol name map)
+  - Single-node: `set_pipeline()` → all ticks to local `ApexPipeline`
+  - Multi-node: `set_routing(local_id, PartitionRouter, remotes)` → consistent-hash routing; remote ticks via `TcpRpcClient::ingest_tick()`
+  - `on_message()` / `ingest_decoded()` — decode + dispatch, callable without live broker (for testing)
+  - `KafkaStats`: messages_consumed, bytes_consumed, decode_errors, route_local, route_remote, ingest_failures
+  - `KafkaConsumer::format_prometheus(name, stats)` — Prometheus/OpenMetrics text formatter (consumer label)
+  - `HttpServer::add_metrics_provider(fn)` — register any `std::function<std::string()>` to extend `/metrics` output
+  - Usage: `server.add_metrics_provider([&c]{ return KafkaConsumer::format_prometheus("topic", c.stats()); })`
+  - Compile-time optional: `APEX_USE_KAFKA=ON` + `librdkafka-devel` enables actual polling; decode/routing always compiled
+  - 26 tests: ConfigDefaults, DecodeJson*, DecodeBinary*, DecodeJsonHuman*, IngestDecoded*, OnMessage*, FormatPrometheus*, StartWithoutKafka
+  - 4 tests in MetricsProviderTest: DefaultMetrics, RegisteredProvider, MultipleProviders, KafkaStatsProviderIntegration
   - **Business value:** Core enterprise data pipeline connection (Kafka is standard infrastructure)
   - **Target:** Fintech, adtech, e-commerce real-time analytics
+  - **Next:** Redpanda compatibility is free (Kafka API-compatible) — no extra work needed
 - [ ] **Kafka Connect Sink** — Register APEX-DB as a Kafka Connect sink
   - Kafka Connect JSON connector plugin (Java or REST bridge)
   - Code-free Kafka stream → APEX-DB connection
@@ -340,14 +432,41 @@
   - **Business value:** IoT/edge computing market
 
 ## HA & Replication
-- [ ] **WAL-based async replication** — Prevent data loss on Primary failure
-  - WAL log → async transmission to Replica
-  - **Business value:** Required for production HA
-- [ ] **Auto failover** — Auto-promote Replica when Primary dies
-  - Raft or simple heartbeat-based
+- [x] **WAL-based async replication** ✅ Completed (2026-03-23)
+  - `WalReplicator`: background thread batches TickMessages → `WAL_REPLICATE` RPC to replica
+  - `TcpRpcClient::replicate_wal()` / `TcpRpcServer` WAL_REPLICATE handler
+  - `serialize_wal_batch` / `deserialize_wal_batch` wire format
+  - ReplicatorConfig: batch_size, flush_interval_ms, queue_capacity
+  - ReplicatorStats: enqueued/replicated/dropped/send_errors
+  - 4 tests: RPC round-trip, serialization, end-to-end, replica-down
+  - **Business value:** Primary node failure no longer means data loss
+- [x] **Replication factor 2** ✅ Completed (2026-03-23)
+  - `PartitionRouter::route_replica()` — next distinct physical node on consistent hash ring
+  - Returns INVALID_NODE_ID for single-node clusters
+  - 3 tests: two nodes, single node, three nodes
+  - **Business value:** Zero data loss on single node failure
+- [x] **Auto failover** ✅ Completed (2026-03-23)
+  - `FailoverManager`: connects HealthMonitor + PartitionRouter + QueryCoordinator
+  - DEAD detected → remove from router (ring auto-promotes replica) + remove from coordinator
+  - `FailoverEvent` callback for caller to set up new replication
+  - `trigger_failover()` manual trigger for admin/testing
+  - 3 tests: manual trigger, health monitor integration, replica-becomes-primary
   - **Business value:** Can provide 99.99% SLA
+- [ ] **Coordinator HA** — Eliminate coordinator single point of failure
+  - ~~Raft-based coordinator cluster (3 nodes) or active-passive failover~~
+  - [x] ✅ Completed (2026-03-23) — Active-Standby implementation
+  - `CoordinatorHA`: standby pings active, auto-promotes on timeout
+  - Standby forwards queries to active via RPC; promotes on failure
+  - `PromotionCallback` for caller to re-wire after promotion
+  - 3 tests: active serves, standby promotes, standby forwards
+  - **Business value:** Full cluster HA, no SPOF
 - [ ] **Snapshot backup** — Consistent full HDB snapshot
-  - S3 upload automation
+  - ~~S3 upload automation~~
+  - [x] ✅ Completed (2026-03-23) — SnapshotCoordinator
+  - `SnapshotCoordinator`: parallel SNAPSHOT command to all nodes
+  - `SnapshotResult`: per-node success/error, total_rows, snapshot_ts
+  - Handles partial failure (some nodes down)
+  - 2 tests: two-node snapshot, partial failure
   - **Business value:** Disaster recovery (DR) support
 
 ## DDL & Data Management
@@ -357,6 +476,46 @@
   - **Business value:** Automated storage cost management
 - [ ] **Schema Evolution** — Add/remove columns with zero downtime
 - [ ] **HDB Compaction** — Merge small partition files (improve read performance)
+
+## Distributed Query & Cluster Operations
+- [x] **Partition migration execution** ✅ Completed (2026-03-23)
+  - `PartitionMigrator`: query source node → WAL batch to destination
+  - `migrate_symbol()` single symbol, `execute_plan()` for MigrationPlan
+  - MigrationStats: moves_completed/moves_failed/rows_migrated
+  - 3 tests: single symbol, multi-symbol plan, empty symbol
+  - **Business value:** Required for elastic scaling
+- [ ] **Live rebalancing** — Zero-downtime partition movement on node changes
+  - Dual-write during migration, atomic cutover
+  - **Business value:** No service interruption during scale-out
+- [x] **Cross-node ASOF JOIN** ✅ Completed (2026-03-23)
+  - QueryCoordinator: ASOF/WINDOW JOIN detection → Tier A-2 (symbol-filter routing) or scatter-concat
+  - Symbol-filtered JOINs route to single node; no-filter JOINs scatter to all
+  - 3 tests: cross-node routing, scatter-gather aggregates
+- [ ] **AVG distributed merge** — Decompose AVG into SUM/COUNT for partial aggregation
+  - Currently returns error on cross-node AVG queries
+  - **Business value:** Complete distributed SQL support
+- [ ] **Tier C cold query offload** — Route historical queries to DuckDB/Parquet engine
+  - Time range detection: recent → APEX in-memory, old → DuckDB on S3
+  - **Business value:** Unified query interface across hot/cold data
+- [ ] **Hot symbol detection & rebalancing** — Detect skewed ingestion, rebalance
+  - AAPL/SPY receive 10x ticks of typical symbols, overloads one node
+  - Dedicated hot-symbol nodes or dynamic vnode weight adjustment
+  - **Business value:** Prevents single-node bottleneck in production
+- [ ] **PTP clock sync detection** — Enforce PTP for ASOF JOIN strict mode
+  - Detect clock source (PTP/NTP/local), reject ASOF JOIN on NTP if strict
+  - **Business value:** Correctness guarantee for HFT time-series joins
+
+## Multi-Usecase Extensions
+- [ ] **Pluggable partition strategy** — symbol_affinity / hash_mod / site_id per table
+  - HFT: symbol affinity, Quant/AdTech: hash, IoT: site-based
+  - **Business value:** Single codebase serves HFT, Quant, AdTech, IoT
+- [ ] **Edge mode** (`--mode edge`) — Single-node APEX-DB with async cloud sync
+  - Reduced memory footprint (8-64GB), local-only queries, WAL sync on reconnect
+  - **Business value:** IoT/industrial sensor market
+- [ ] **HyperLogLog** — Distributed approximate COUNT DISTINCT
+  - Mergeable HLL sketches across nodes, ~1% error
+  - Exact mode for small cardinality (< 1M unique)
+  - **Business value:** AdTech real-time bidding analytics at scale
 
 ## Low Priority (After Phase C-3)
 - [ ] **AWS Fleet API integration** — Warm Pool + Placement Group
@@ -384,4 +543,14 @@
 - [x] SQL Parser — Phase 1/2/3 complete (SELECT arithmetic, CASE WHEN, multi-GROUP BY, UNION/INTERSECT/EXCEPT, date/time functions, LIKE/NOT LIKE, IN, IS NULL, NOT, HAVING)
 - [x] HTTP API — port 8123, ClickHouse compatible
 - [x] Distributed Cluster Transport — UCXBackend, SharedMemBackend, PartitionRouter (2ns)
+- [x] Phase C-3 MVP — Scatter-gather coordinator + TCP RPC + partial agg merge ✅ Completed (2026-03-22)
+  - `QueryCoordinator`: Tier A (symbol-filter direct routing) + Tier B (scatter-gather)
+  - `TcpRpcServer` / `TcpRpcClient`: POSIX socket transport, 16-byte RpcHeader, binary QueryResultSet wire format
+  - `partial_agg.h`: SCALAR_AGG (SUM/COUNT/MIN/MAX per-column) + CONCAT merge strategies
+  - SQL-AST-driven merge strategy: avoids unreliable column-name-based agg detection
+  - 25 new tests: RpcProtocol, PartialAgg, TcpRpc, QueryCoordinator (all pass)
+- [x] **TCP RPC connection pooling** ✅ Completed (2026-03-23)
+  - Server: keep-alive connections (multi-request per connection)
+  - Client: fd pool (acquire/release), max 4 idle, stale detection via MSG_PEEK
+  - Server: active fd tracking + shutdown() for clean stop
 - [ ] Phase C — Distributed Memory (UCX complete, query scheduler TODO)

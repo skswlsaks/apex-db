@@ -2,3 +2,7 @@ build/
 *.o
 *.a
 *.so
+.openclaw
+*.pem
+build_clang
+__pycache__

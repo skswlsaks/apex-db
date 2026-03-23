@@ -215,6 +215,41 @@ tests/python/
 └── test_streaming.py          41  — StreamingSession: pandas/polars/iter/stats/perf
 ```
 
+### Python Packaging — `pip install apex-db` ✅ (2026-03-23)
+
+**Distribution name:** `apex-db` · **Import name:** `apex_py` · **Version:** 0.1.0
+
+```
+# Build from source
+pip install build twine
+python -m build          # produces dist/apex_db-0.1.0-py3-none-any.whl
+                         #         and dist/apex_db-0.1.0.tar.gz
+twine check dist/*       # → PASSED
+
+# Install locally
+pip install dist/apex_db-0.1.0-py3-none-any.whl
+
+# Install with optional extras
+pip install "apex-db[all]"      # numpy, pandas, polars, pyarrow, duckdb
+pip install "apex-db[pandas]"   # numpy + pandas only
+pip install "apex-db[polars]"   # polars only
+pip install "apex-db[duckdb]"   # duckdb only
+```
+
+**pyproject.toml key settings:**
+
+| Field | Value |
+|-------|-------|
+| `build-backend` | `setuptools.build_meta` (PEP 517/518) |
+| `name` | `apex-db` |
+| `license` | `Apache-2.0` (SPDX string) |
+| `requires-python` | `>=3.9` |
+| `dependencies` | `[]` — zero mandatory deps |
+
+The wheel is a **pure-Python** `py3-none-any` wheel. When the C++ extension (`apex_core.so`) is available (built separately via CMake), it is imported automatically at runtime — the Python wheel ships only the client/integration layer.
+
+To publish to PyPI: `twine upload dist/*` (requires a PyPI account and `~/.pypirc` token).
+
 ---
 
 ## 3. SQL Support (current implementation)
@@ -436,7 +471,90 @@ auto result = executor.execute(ast);
 
 ---
 
-## 6. Roadmap
+## 6. Connection Hooks (`.z.po` / `.z.pc` equivalent)
+
+**Status:** ✅ Implemented (2026-03-23)
+
+kdb+ has `.z.po` (port open) and `.z.pc` (port close) callbacks for session lifecycle management. APEX-DB provides an equivalent through `HttpServer`.
+
+### API
+
+```cpp
+HttpServer server(executor, 8123);
+
+// .z.po equivalent — fires on first request from a new remote address
+server.set_on_connect([](const apex::server::ConnectionInfo& info) {
+    printf("Connect: %s at %lld\n", info.remote_addr.c_str(), info.connected_at_ns);
+});
+
+// .z.pc equivalent — fires on Connection:close or eviction
+server.set_on_disconnect([](const apex::server::ConnectionInfo& info) {
+    printf("Disconnect: %s queries=%llu\n",
+           info.remote_addr.c_str(), info.query_count);
+});
+
+// Session management
+auto sessions = server.list_sessions();                // snapshot
+size_t n = server.evict_idle_sessions(30 * 60 * 1000); // evict idle > 30min
+```
+
+### `ConnectionInfo` Structure
+
+```cpp
+struct ConnectionInfo {
+    std::string remote_addr;     // IP:port
+    std::string user;            // auth subject or remote_addr
+    int64_t     connected_at_ns; // epoch-ns, first request
+    int64_t     last_active_ns;  // epoch-ns, most recent request
+    uint64_t    query_count;     // requests in this session
+};
+```
+
+### REST Endpoint
+
+```
+GET /admin/sessions    →  [{remote_addr, user, connected_at_ns, last_active_ns, query_count}, ...]
+```
+Requires admin permission.
+
+### Implementation Notes
+
+- httplib `set_logger` fires after every HTTP response — used to track session state
+- `Connection: close` request header triggers `on_disconnect` (HTTP/1.1 semantics)
+- Session key: `remote_addr` (IP:port); `evict_idle_sessions` fires `on_disconnect` for each removed session
+- Files: `include/apex/server/http_server.h`, `src/server/http_server.cpp`
+
+---
+
+## 7. Interactive Query Timer (`\t <sql>`)
+
+**Status:** ✅ Implemented (2026-03-23)
+
+kdb+ supports `\t expr` to time a single expression without toggling the global timer. apex-cli now supports the same one-shot syntax.
+
+### Usage
+
+```
+apex> \t SELECT sum(volume) FROM trades WHERE symbol = 1
++-------------+
+| sum(volume) |
++-------------+
+| 1045        |
++-------------+
+1 row in set
+Time: 0.42 ms
+
+apex> \t                ← toggle ON/OFF (existing, unchanged)
+Timing ON
+```
+
+- `\t <sql>` — runs one query with timing; global toggle state is not changed
+- `\t` alone — toggles timing ON/OFF
+- File: `tools/apex-cli.cpp`, `BuiltinCommands::handle()`
+
+---
+
+## 8. Roadmap
 
 - [x] HTTP API + ClickHouse compatibility ✅
 - [x] pybind11 zero-copy Python binding ✅
@@ -445,15 +563,18 @@ auto result = executor.execute(ast);
 - [x] **SQL Phase 1** — IN, IS NULL, NOT, HAVING ✅
 - [x] **SQL Phase 2** — SELECT arithmetic, CASE WHEN, multi-column GROUP BY ✅
 - [x] **SQL Phase 3** — DATE_TRUNC/NOW/EPOCH_S/EPOCH_MS, LIKE/NOT LIKE, UNION/INTERSECT/EXCEPT ✅
-- [ ] SQL Subquery / CTE (WITH clause)
+- [x] **SQL Subquery / CTE** — WITH clause, FROM (subquery) ✅
+- [x] **Connection hooks** — `.z.po/.z.pc` equivalent, session tracking ✅ (2026-03-23)
+- [x] **`\t <sql>` one-shot timer** — interactive query timing ✅ (2026-03-23)
+- [x] **`pip install apex-db` Python wheel** — PEP 517/518 packaging, `twine check` PASSED ✅ (2026-03-23)
 - [ ] SQL Window RANGE mode (currently ROWS only)
 - [ ] Python DSL → LLVM JIT direct compilation
 - [ ] Arrow Flight server (stream results as Arrow over network)
-- [ ] `pip install apex-db` PyPI package
+- [ ] PyPI publish (requires PyPI account + token)
 
 ---
 
-## 7. Streaming Data Source Connectors (Backlog)
+## 9. Streaming Data Source Connectors (Backlog)
 
 - Kafka/Redpanda/Pulsar (librdkafka, C++ client)
 - AWS Kinesis, Azure Event Hubs, Google Pub/Sub

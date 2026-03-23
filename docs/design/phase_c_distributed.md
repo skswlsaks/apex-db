@@ -314,9 +314,26 @@ Client Query(VWAP, symbol=AAPL, range=24h)
 - Placement Group configuration
 - EFA real-world testing
 
+### Phase C-3 MVP: QueryCoordinator + TCP RPC ✅ Completed (2026-03-22)
+- `QueryCoordinator` — two-tier routing:
+  - Tier A: `WHERE symbol = N` → consistent-hash direct route to owning node
+  - Tier B: scatter-gather to all nodes → partial aggregation merge
+- `TcpRpcServer` / `TcpRpcClient` — POSIX socket transport
+  - 16-byte `RpcHeader` (magic=0x41504558, type, request_id, payload_len)
+  - Binary `QueryResultSet` wire format (error, column names/types, packed int64 rows)
+  - One TCP connection per request (simple, stateless)
+- `partial_agg.h` — merge strategies:
+  - `SCALAR_AGG`: SQL-AST-driven per-column merge (SUM/COUNT=add, MIN=min, MAX=max, AVG=error)
+  - `CONCAT`: plain rows or GROUP BY with symbol affinity (no key overlap)
+  - Strategy detected from SQL AST (not column names — executor returns raw names)
+- 25 tests: RpcProtocol (5), PartialAgg (11), TcpRpc (4), QueryCoordinator (5)
+- Key design: `merge_scalar_with_sql_aggs()` uses `SelectExpr.agg` from parsed AST,
+  avoiding the unreliable column-name-based detection (`count(*) → "*"`)
+
 ### Phase C-4: Distributed Query
-- Scatter-gather query execution
-- Partial result aggregation
+- UCX scatter-gather (replace TCP with RDMA for production)
+- Consistent hashing for live node add/remove
+- Replication factor 2 with automatic failover
 - Multi-node benchmarks
 
 ---

@@ -17,6 +17,10 @@ add_executable(apex_tests
     unit/test_financial_functions.cpp
     unit/test_parallel.cpp
     unit/test_auth.cpp
+    unit/test_coordinator.cpp
+    unit/test_scheduler.cpp
+    unit/test_features.cpp
+    unit/test_kafka.cpp
 )
 target_include_directories(apex_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/cluster   # shm_backend.h access
@@ -29,10 +33,16 @@ target_link_libraries(apex_tests PRIVATE
     apex_cluster
     apex_sql
     apex_auth
+    apex_scheduler
+    apex_server
+    apex_kafka
     GTest::gtest_main
 )
 if(APEX_HAS_OPENSSL)
     target_link_libraries(apex_tests PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
+if(APEX_USE_TCMALLOC AND TCMALLOC_LIB)
+    target_link_libraries(apex_tests PRIVATE ${TCMALLOC_LIB})
 endif()
 
 include(GoogleTest)
@@ -50,13 +60,14 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/feeds/test_fix_parser.cpp")
     target_link_libraries(test_feeds PRIVATE
         apex_feeds
         apex_common
-        GTest::gtest_main
+        GTest::gtest
     )
     gtest_discover_tests(test_feeds)
 endif()
 
 # --- Feed Handler Benchmarks ---
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/feeds/benchmark_feed_handlers.cpp")
+find_package(benchmark QUIET)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/feeds/benchmark_feed_handlers.cpp" AND benchmark_FOUND)
     add_executable(bench_feeds
         feeds/benchmark_feed_handlers.cpp
     )
@@ -66,7 +77,7 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/feeds/benchmark_feed_handlers.cpp")
     target_link_libraries(bench_feeds PRIVATE
         apex_feeds
         apex_common
-        GTest::gtest_main
+        benchmark::benchmark
     )
     target_compile_options(bench_feeds PRIVATE -O3 -march=native)
 endif()
@@ -74,6 +85,7 @@ endif()
 # --- Migration Tests ---
 add_executable(test_migration
     migration/test_q_to_sql.cpp
+    migration/test_q_to_python.cpp
     migration/test_hdb_loader.cpp
     migration/test_clickhouse.cpp
     migration/test_duckdb.cpp
@@ -85,7 +97,7 @@ target_include_directories(test_migration PRIVATE
 target_link_libraries(test_migration PRIVATE
     apex_migration
     apex_common
-    GTest::gtest_main
+    GTest::gtest
 )
 gtest_discover_tests(test_migration)
 

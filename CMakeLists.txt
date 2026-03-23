@@ -37,6 +37,9 @@ option(APEX_USE_HIGHWAY    "Enable Highway SIMD"         ON)
 option(APEX_USE_LZ4        "Enable LZ4 compression"     ON)
 option(APEX_USE_PARQUET    "Enable Apache Parquet output" ON)
 option(APEX_USE_S3         "Enable AWS S3 upload"        ON)
+option(APEX_USE_TCMALLOC   "Link tcmalloc_minimal for HFT allocation performance" OFF)
+option(APEX_USE_LTO        "Enable Link-Time Optimization (GCC -flto)" OFF)
+option(APEX_USE_KAFKA      "Enable Apache Kafka consumer (requires librdkafka++)" OFF)
 
 # ============================================================================
 # Compiler Flags
@@ -51,6 +54,36 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
 set(CMAKE_CXX_FLAGS_DEBUG   "-g -O0 -fsanitize=address,undefined")
 set(CMAKE_EXE_LINKER_FLAGS_DEBUG "-fsanitize=address,undefined")
 set(CMAKE_SHARED_LINKER_FLAGS_DEBUG "-fsanitize=address,undefined")
+
+# LTO: appended to release flags when APEX_USE_LTO=ON
+if(APEX_USE_LTO)
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -flto")
+    set(CMAKE_EXE_LINKER_FLAGS  "${CMAKE_EXE_LINKER_FLAGS} -flto")
+    message(STATUS "LTO: enabled (-flto)")
+endif()
+
+# tcmalloc: link tcmalloc_minimal for HFT workloads with many small allocations
+if(APEX_USE_TCMALLOC)
+    find_library(TCMALLOC_LIB tcmalloc_minimal REQUIRED)
+    message(STATUS "tcmalloc_minimal: ${TCMALLOC_LIB}")
+endif()
+
+# --- librdkafka++ (Kafka consumer, optional) ---
+if(APEX_USE_KAFKA)
+    find_library(RDKAFKA_CPP_LIB rdkafka++ QUIET)
+    find_library(RDKAFKA_LIB     rdkafka   QUIET)
+    if(RDKAFKA_CPP_LIB AND RDKAFKA_LIB)
+        message(STATUS "librdkafka++: ${RDKAFKA_CPP_LIB} (Kafka consumer enabled)")
+        set(APEX_HAS_KAFKA ON)
+    else()
+        message(STATUS "librdkafka++: not found — Kafka consumer disabled")
+        message(STATUS "  Install: sudo dnf install -y librdkafka-devel")
+        set(APEX_USE_KAFKA OFF)
+        set(APEX_HAS_KAFKA OFF)
+    endif()
+else()
+    set(APEX_HAS_KAFKA OFF)
+endif()
 
 # ============================================================================
 # Dependencies
@@ -100,6 +133,7 @@ endif()
 find_library(NUMA_LIB numa REQUIRED)
 
 # --- Apache Arrow + Parquet (optional) ---
+find_package(PkgConfig QUIET)
 if(APEX_USE_PARQUET)
     find_package(Arrow CONFIG QUIET)
     find_package(Parquet CONFIG QUIET)
@@ -203,6 +237,7 @@ add_library(apex_storage STATIC
     src/storage/hdb_reader.cpp
     src/storage/flush_manager.cpp
     src/storage/parquet_writer.cpp
+    src/storage/parquet_reader.cpp
     src/storage/s3_sink.cpp
 )
 target_include_directories(apex_storage PUBLIC
@@ -258,6 +293,7 @@ add_library(apex_execution STATIC
     src/execution/parallel_scan.cpp
     src/execution/local_scheduler.cpp
     src/execution/distributed_scheduler.cpp
+    src/execution/resource_isolation.cpp
 )
 if(APEX_USE_JIT)
     target_sources(apex_execution PRIVATE src/execution/jit_engine.cpp)
@@ -352,11 +388,22 @@ if(APEX_HAS_OPENSSL)
     target_link_libraries(apex_server PUBLIC OpenSSL::SSL OpenSSL::Crypto)
     target_compile_definitions(apex_server PUBLIC APEX_TLS_ENABLED=1)
 endif()
+if(APEX_USE_TCMALLOC AND TCMALLOC_LIB)
+    target_link_libraries(apex_server PUBLIC ${TCMALLOC_LIB})
+endif()
 
 # --- Phase C: Cluster (분산 메모리 & 트랜스포트) ---
 add_library(apex_cluster STATIC
     src/cluster/shm_backend.cpp
     src/cluster/ucx_backend.cpp
+    src/cluster/tcp_rpc.cpp
+    src/cluster/query_coordinator.cpp
+    src/cluster/wal_replicator.cpp
+    src/cluster/partition_migrator.cpp
+    src/cluster/failover_manager.cpp
+    src/cluster/coordinator_ha.cpp
+    src/cluster/snapshot_coordinator.cpp
+    src/cluster/compute_node.cpp
 )
 target_include_directories(apex_cluster PUBLIC
     ${CMAKE_SOURCE_DIR}/include
@@ -364,6 +411,7 @@ target_include_directories(apex_cluster PUBLIC
 )
 target_link_libraries(apex_cluster PUBLIC
     apex_core
+    apex_sql
 )
 # UCX 발견 시 APEX_HAS_UCX 정의 + 링크
 if(APEX_USE_UCX AND UCX_FOUND)
@@ -376,6 +424,7 @@ add_library(apex_migration STATIC
     src/migration/q_lexer.cpp
     src/migration/q_parser.cpp
     src/migration/q_to_sql.cpp
+    src/migration/q_to_python.cpp
     src/migration/hdb_loader.cpp
     src/migration/clickhouse_migrator.cpp
     src/migration/duckdb_interop.cpp
@@ -386,6 +435,17 @@ target_include_directories(apex_migration PUBLIC
 )
 target_link_libraries(apex_migration PUBLIC
     apex_common
+)
+
+# --- Scheduler (.z.ts equivalent) ---
+add_library(apex_scheduler STATIC
+    src/scheduler/scheduler.cpp
+)
+target_include_directories(apex_scheduler PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(apex_scheduler PUBLIC
+    Threads::Threads
 )
 
 # --- Feed Handler Adapters ---
@@ -399,6 +459,25 @@ target_include_directories(apex_feeds PUBLIC
 target_link_libraries(apex_feeds PUBLIC
     apex_common
 )
+
+# --- Kafka Consumer (depends on apex_core + apex_cluster for routing) ---
+add_library(apex_kafka STATIC
+    src/feeds/kafka_consumer.cpp
+)
+target_include_directories(apex_kafka PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(apex_kafka PUBLIC
+    apex_core
+    apex_cluster
+)
+if(APEX_HAS_KAFKA)
+    target_compile_definitions(apex_kafka PUBLIC APEX_KAFKA_AVAILABLE=1)
+    target_link_libraries(apex_kafka PUBLIC ${RDKAFKA_CPP_LIB} ${RDKAFKA_LIB})
+    message(STATUS "apex_kafka: Kafka polling enabled")
+else()
+    message(STATUS "apex_kafka: decode/routing only (no librdkafka)")
+endif()
 
 # ============================================================================
 # Tools
@@ -432,6 +511,12 @@ if(READLINE_LIB)
     target_compile_definitions(apex-cli PRIVATE HAVE_READLINE=1)
 endif()
 target_compile_options(apex-cli PRIVATE -O2)
+
+# Standalone data node (for multi-process integration testing)
+add_executable(apex_data_node tools/apex_data_node.cpp)
+target_include_directories(apex_data_node PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(apex_data_node PRIVATE
+    apex_cluster apex_sql apex_execution apex_core apex_storage apex_ingestion)
 
 # ============================================================================
 # Tests

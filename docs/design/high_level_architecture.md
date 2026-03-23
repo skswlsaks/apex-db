@@ -39,7 +39,7 @@ open-source licensing.
 │  Layer 3: Execution Engine                               │
 │  Highway SIMD (AVX2/AVX-512/SVE)                        │
 │  LLVM JIT (O3, native codegen)                           │
-│  JOIN: ASOF O(n) · Hash · LEFT · Window JOIN (wj)        │
+│  JOIN: ASOF O(n) · Hash · LEFT · RIGHT · FULL · Window (wj) · uj/pj/aj0 │
 │  Window Functions: SUM/AVG/MIN/MAX/LAG/LEAD/RANK/EMA     │
 │  Financial: xbar · VWAP · DELTA · RATIO · FIRST · LAST  │
 │  Parallel: 8-thread scatter/gather (3.48x speedup)       │
