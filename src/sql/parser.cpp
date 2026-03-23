@@ -65,6 +65,13 @@ SelectStmt Parser::parse(const std::string& sql) {
     tokens_ = tok.tokenize(sql);
     pos_ = 0;
 
+    // EXPLAIN prefix: parse the flag, then the rest as normal SELECT
+    bool is_explain = false;
+    if (check(TokenType::EXPLAIN)) {
+        advance();
+        is_explain = true;
+    }
+
     // WITH clause: parse CTE definitions before the main SELECT
     std::vector<CTEDef> cte_defs;
     if (check(TokenType::WITH)) {
@@ -73,6 +80,7 @@ SelectStmt Parser::parse(const std::string& sql) {
 
     SelectStmt stmt = parse_select();
     stmt.cte_defs = std::move(cte_defs);
+    stmt.explain  = is_explain;
 
     // UNION [ALL] / INTERSECT / EXCEPT chaining
     while (check(TokenType::UNION) || check(TokenType::INTERSECT) || check(TokenType::EXCEPT)) {
@@ -149,6 +157,10 @@ SelectStmt Parser::parse_select() {
             && current().type != TokenType::LIMIT
             && current().type != TokenType::INNER
             && current().type != TokenType::LEFT
+            && current().type != TokenType::RIGHT
+            && current().type != TokenType::FULL
+            && current().type != TokenType::PLUS_JOIN
+            && current().type != TokenType::AJ0
             && current().type != TokenType::WINDOW
             && current().type != TokenType::UNION
             && current().type != TokenType::INTERSECT
@@ -158,9 +170,12 @@ SelectStmt Parser::parse_select() {
         }
     }
 
-    // JOIN (ASOF JOIN, INNER JOIN, JOIN, LEFT JOIN, WINDOW JOIN)
-    if (check(TokenType::ASOF) || check(TokenType::JOIN)
+    // JOIN (ASOF JOIN, AJ0 JOIN, INNER JOIN, JOIN, LEFT JOIN, RIGHT JOIN, FULL JOIN, PLUS JOIN, UNION JOIN, WINDOW JOIN)
+    bool is_union_join = check(TokenType::UNION) && peek().type == TokenType::JOIN;
+    if (check(TokenType::ASOF) || check(TokenType::AJ0) || check(TokenType::JOIN)
         || check(TokenType::INNER) || check(TokenType::LEFT)
+        || check(TokenType::RIGHT) || check(TokenType::FULL)
+        || check(TokenType::PLUS_JOIN) || is_union_join
         || check(TokenType::WINDOW)) {
         stmt.join = parse_join();
     }
@@ -551,6 +566,12 @@ JoinClause Parser::parse_join() {
         expect(TokenType::JOIN, "JOIN");
         jc.type = JoinClause::Type::ASOF;
     }
+    // AJ0 JOIN (left-columns-only asof join)
+    else if (check(TokenType::AJ0)) {
+        advance();
+        expect(TokenType::JOIN, "JOIN");
+        jc.type = JoinClause::Type::AJ0;
+    }
     // INNER JOIN 또는 JOIN
     else if (match(TokenType::INNER)) {
         expect(TokenType::JOIN, "JOIN");
@@ -561,6 +582,30 @@ JoinClause Parser::parse_join() {
         match(TokenType::OUTER); // optional
         expect(TokenType::JOIN, "JOIN");
         jc.type = JoinClause::Type::LEFT;
+    }
+    // RIGHT [OUTER] JOIN
+    else if (match(TokenType::RIGHT)) {
+        match(TokenType::OUTER); // optional
+        expect(TokenType::JOIN, "JOIN");
+        jc.type = JoinClause::Type::RIGHT;
+    }
+    // FULL [OUTER] JOIN
+    else if (match(TokenType::FULL)) {
+        match(TokenType::OUTER); // optional
+        expect(TokenType::JOIN, "JOIN");
+        jc.type = JoinClause::Type::FULL;
+    }
+    // PLUS JOIN (kdb+ pj)
+    else if (check(TokenType::PLUS_JOIN)) {
+        advance();
+        expect(TokenType::JOIN, "JOIN");
+        jc.type = JoinClause::Type::PLUS;
+    }
+    // UNION JOIN (kdb+ uj)
+    else if (check(TokenType::UNION)) {
+        advance();
+        expect(TokenType::JOIN, "JOIN");
+        jc.type = JoinClause::Type::UNION_JOIN;
     }
     // WINDOW JOIN — kdb+ wj 스타일
     else if (check(TokenType::WINDOW)) {
@@ -583,7 +628,11 @@ JoinClause Parser::parse_join() {
         advance();
     }
 
-    // ON 절
+    // ON 절 (UNION JOIN은 ON 불필요)
+    if (jc.type == JoinClause::Type::UNION_JOIN) {
+        // UNION JOIN: ON clause is optional
+        if (!check(TokenType::ON)) return jc;
+    }
     expect(TokenType::ON, "ON");
 
     // ON 조건 파싱
@@ -1036,6 +1085,23 @@ std::shared_ptr<ArithExpr> Parser::parse_arith_primary() {
         node->kind      = ArithExpr::Kind::FUNC;
         node->func_name = "epoch_ms";
         node->func_arg  = parse_arith_expr_node();
+        expect(TokenType::RPAREN, ")");
+        return node;
+    }
+
+    // SUBSTR(col, start, len)
+    if (check(TokenType::SUBSTR)) {
+        advance();
+        expect(TokenType::LPAREN, "(");
+        node->kind      = ArithExpr::Kind::FUNC;
+        node->func_name = "substr";
+        node->func_arg  = parse_arith_expr_node();  // column or expr
+        expect(TokenType::COMMA, ",");
+        node->func_unit = current().value;           // start position (reuse func_unit)
+        advance();
+        if (match(TokenType::COMMA)) {
+            node->func_arg2 = parse_arith_expr_node(); // length
+        }
         expect(TokenType::RPAREN, ")");
         return node;
     }

@@ -114,10 +114,11 @@ void AsofJoinOperator::asof_match_symbol(
 }
 
 // ============================================================================
-// HashJoinOperator::execute — INNER / LEFT JOIN
+// HashJoinOperator::execute — INNER / LEFT / RIGHT JOIN
 // ============================================================================
 // INNER: 매칭된 쌍만 반환
 // LEFT:  매칭 없는 왼쪽 행도 포함 (right_indices[i] = -1)
+// RIGHT: 매칭 없는 오른쪽 행도 포함 (left_indices[i] = -1)
 // ============================================================================
 JoinResult HashJoinOperator::execute(
     const ColumnVector& left_key,
@@ -135,34 +136,79 @@ JoinResult HashJoinOperator::execute(
     result.left_indices.reserve(std::min(ln, rn));
     result.right_indices.reserve(std::min(ln, rn));
 
-    // ── Build phase: key → [right_row_index, ...] ──
-    std::unordered_map<int64_t, std::vector<int64_t>> hash_map;
-    hash_map.reserve(rn * 2);
+    if (join_type_ == JoinType::RIGHT) {
+        // RIGHT: build on left, probe with right
+        std::unordered_map<int64_t, std::vector<int64_t>> hash_map;
+        hash_map.reserve(ln * 2);
+        for (size_t li = 0; li < ln; ++li)
+            hash_map[lk[li]].push_back(static_cast<int64_t>(li));
 
-    for (size_t ri = 0; ri < rn; ++ri) {
-        hash_map[rk[ri]].push_back(static_cast<int64_t>(ri));
-    }
-
-    // ── Probe phase ──
-    for (size_t li = 0; li < ln; ++li) {
-        auto it = hash_map.find(lk[li]);
-
-        if (it == hash_map.end()) {
-            // LEFT JOIN: 매칭 없는 왼쪽 행도 포함
-            if (join_type_ == JoinType::LEFT) {
-                result.left_indices.push_back(static_cast<int64_t>(li));
-                result.right_indices.push_back(-1LL); // NULL 표시
+        for (size_t ri = 0; ri < rn; ++ri) {
+            auto it = hash_map.find(rk[ri]);
+            if (it == hash_map.end()) {
+                result.left_indices.push_back(-1LL);  // left NULL
+                result.right_indices.push_back(static_cast<int64_t>(ri));
+                ++result.match_count;
+                continue;
+            }
+            for (int64_t li : it->second) {
+                result.left_indices.push_back(li);
+                result.right_indices.push_back(static_cast<int64_t>(ri));
                 ++result.match_count;
             }
-            // INNER JOIN: 스킵
-            continue;
         }
+    } else if (join_type_ == JoinType::FULL) {
+        // FULL OUTER: LEFT JOIN + unmatched right rows
+        std::unordered_map<int64_t, std::vector<int64_t>> hash_map;
+        hash_map.reserve(rn * 2);
+        for (size_t ri = 0; ri < rn; ++ri)
+            hash_map[rk[ri]].push_back(static_cast<int64_t>(ri));
 
-        // 매칭된 오른쪽 행 전부 (1:N, N:M 지원)
-        for (int64_t ri : it->second) {
-            result.left_indices.push_back(static_cast<int64_t>(li));
-            result.right_indices.push_back(ri);
-            ++result.match_count;
+        std::vector<bool> right_matched(rn, false);
+        for (size_t li = 0; li < ln; ++li) {
+            auto it = hash_map.find(lk[li]);
+            if (it == hash_map.end()) {
+                result.left_indices.push_back(static_cast<int64_t>(li));
+                result.right_indices.push_back(-1LL);
+                ++result.match_count;
+                continue;
+            }
+            for (int64_t ri : it->second) {
+                result.left_indices.push_back(static_cast<int64_t>(li));
+                result.right_indices.push_back(ri);
+                right_matched[static_cast<size_t>(ri)] = true;
+                ++result.match_count;
+            }
+        }
+        for (size_t ri = 0; ri < rn; ++ri) {
+            if (!right_matched[ri]) {
+                result.left_indices.push_back(-1LL);
+                result.right_indices.push_back(static_cast<int64_t>(ri));
+                ++result.match_count;
+            }
+        }
+    } else {
+        // INNER / LEFT: build on right, probe with left
+        std::unordered_map<int64_t, std::vector<int64_t>> hash_map;
+        hash_map.reserve(rn * 2);
+        for (size_t ri = 0; ri < rn; ++ri)
+            hash_map[rk[ri]].push_back(static_cast<int64_t>(ri));
+
+        for (size_t li = 0; li < ln; ++li) {
+            auto it = hash_map.find(lk[li]);
+            if (it == hash_map.end()) {
+                if (join_type_ == JoinType::LEFT) {
+                    result.left_indices.push_back(static_cast<int64_t>(li));
+                    result.right_indices.push_back(-1LL);
+                    ++result.match_count;
+                }
+                continue;
+            }
+            for (int64_t ri : it->second) {
+                result.left_indices.push_back(static_cast<int64_t>(li));
+                result.right_indices.push_back(ri);
+                ++result.match_count;
+            }
         }
     }
 

@@ -6,7 +6,7 @@
 // 지원 SQL:
 //   SELECT [DISTINCT] col_expr [, col_expr ...] [AS alias]
 //   FROM table [alias]
-//   [ASOF | INNER | LEFT] JOIN table [alias] ON cond [AND cond ...]
+//   [ASOF | INNER | LEFT | RIGHT] JOIN table [alias] ON cond [AND cond ...]
 //   [WHERE cond [AND|OR cond ...]]
 //   [GROUP BY col [, col ...]]
 //   [ORDER BY col [ASC|DESC] [, ...]]
@@ -163,13 +163,15 @@ struct ArithExpr {
     std::shared_ptr<ArithExpr> left;
     std::shared_ptr<ArithExpr> right;
 
-    // FUNC: date/time function call
-    // func_name: "date_trunc" | "now" | "epoch_s" | "epoch_ms"
+    // FUNC: date/time function call or string function
+    // func_name: "date_trunc" | "now" | "epoch_s" | "epoch_ms" | "substr"
     // func_unit: unit string for date_trunc ("ns","us","ms","s","min","hour","day","week")
     // func_arg:  argument expression (nullptr for NOW())
+    // func_arg2: second argument expression (for SUBSTR length)
     std::string func_name;
     std::string func_unit;
     std::shared_ptr<ArithExpr> func_arg;
+    std::shared_ptr<ArithExpr> func_arg2;
 };
 
 // ============================================================================
@@ -256,7 +258,7 @@ struct JoinCondition {
 // JoinClause
 // ============================================================================
 struct JoinClause {
-    enum class Type { INNER, ASOF, LEFT, WINDOW };
+    enum class Type { INNER, ASOF, LEFT, RIGHT, FULL, WINDOW, UNION_JOIN, PLUS, AJ0 };
 
     Type                        type = Type::INNER;
     std::string                 table;
@@ -302,6 +304,7 @@ struct SelectStmt {
     // WITH clause CTE definitions (executed before the main SELECT)
     std::vector<CTEDef>         cte_defs;
 
+    bool                        explain  = false; // EXPLAIN prefix — return plan text
     bool                        distinct = false;
     std::vector<SelectExpr>     columns;       // SELECT 목록
     std::string                 from_table;    // FROM 테이블명 (empty if from_subquery is set)

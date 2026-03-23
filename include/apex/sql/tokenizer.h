@@ -58,8 +58,19 @@ enum class TokenType {
     EPOCH_S,    // EPOCH_S(col) — nanoseconds → seconds
     EPOCH_MS,   // EPOCH_MS(col) — nanoseconds → milliseconds
 
+    // 문자열 함수
+    SUBSTR,     // SUBSTR(col, start, len)
+
     // 문자열 연산자
     LIKE,       // col LIKE 'pattern'
+
+    // kdb+ 조인 키워드
+    FULL,       // FULL [OUTER] JOIN
+    PLUS_JOIN,  // PLUS JOIN (kdb+ pj)
+    AJ0,        // AJ0 JOIN (left-columns-only asof join)
+
+    // Query plan
+    EXPLAIN,    // EXPLAIN SELECT ...
 
     // CTE / subquery
     WITH,       // WITH name AS (...)

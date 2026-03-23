@@ -27,7 +27,12 @@ using apex::storage::ColumnType;
 struct QueryResultSet {
     std::vector<std::string>             column_names;
     std::vector<ColumnType>              column_types;
-    std::vector<std::vector<int64_t>>    rows;    // 모든 값을 int64로 (scaled)
+    std::vector<std::vector<int64_t>>    rows;    // all values as int64 (scaled)
+
+    // String-typed result rows (EXPLAIN plan, future string columns).
+    // When non-empty, each entry corresponds to one plan/text row.
+    // column_names = {"plan"}, string_rows[i] = plan line i.
+    std::vector<std::string>             string_rows;
 
     double  execution_time_us = 0.0;
     size_t  rows_scanned      = 0;
@@ -146,6 +151,18 @@ private:
         const std::vector<apex::storage::Partition*>& left_partitions,
         const std::vector<apex::storage::Partition*>& right_partitions);
 
+    // UNION JOIN 실행 (kdb+ uj — merge columns from both tables)
+    QueryResultSet exec_union_join(
+        const SelectStmt& stmt,
+        const std::vector<apex::storage::Partition*>& left_partitions,
+        const std::vector<apex::storage::Partition*>& right_partitions);
+
+    // PLUS JOIN 실행 (kdb+ pj — additive join on matching keys)
+    QueryResultSet exec_plus_join(
+        const SelectStmt& stmt,
+        const std::vector<apex::storage::Partition*>& left_partitions,
+        const std::vector<apex::storage::Partition*>& right_partitions);
+
     // 윈도우 함수 적용 (결과에 새 컬럼 추가)
     void apply_window_functions(
         const SelectStmt& stmt,
@@ -166,6 +183,16 @@ private:
     // WHERE timestamp BETWEEN X AND Y 조건 추출
     bool extract_time_range(const SelectStmt& stmt,
                             int64_t& out_lo, int64_t& out_hi) const;
+
+    // WHERE col BETWEEN X AND Y / col >= X AND col <= Y on an s#-sorted column.
+    // Returns true (and populates out_col/out_lo/out_hi) if the WHERE clause
+    // contains a tightenable range condition on any sorted column in the given
+    // partition.
+    bool extract_sorted_col_range(const SelectStmt& stmt,
+                                  const apex::storage::Partition& part,
+                                  std::string& out_col,
+                                  int64_t& out_lo,
+                                  int64_t& out_hi) const;
 
     // ORDER BY + LIMIT 적용 (top-N partial sort)
     void apply_order_by(QueryResultSet& result, const SelectStmt& stmt);
@@ -188,6 +215,11 @@ private:
 
     // 병렬 단순 집계 (GROUP BY 없음)
     QueryResultSet exec_agg_parallel(
+        const SelectStmt& stmt,
+        const std::vector<apex::storage::Partition*>& partitions);
+
+    // 병렬 단순 SELECT (집계 없음)
+    QueryResultSet exec_simple_select_parallel(
         const SelectStmt& stmt,
         const std::vector<apex::storage::Partition*>& partitions);
 

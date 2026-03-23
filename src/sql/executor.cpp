@@ -78,6 +78,19 @@ static int64_t eval_arith_vt(const ArithExpr& e,
             break;
         }
         case ArithExpr::Kind::FUNC:
+            if (e.func_name == "substr") {
+                int64_t arg = e.func_arg ? eval_arith_vt(*e.func_arg, src, col_idx, row_idx) : 0;
+                std::string s = std::to_string(arg);
+                int64_t start = e.func_unit.empty() ? 1 : std::stoll(e.func_unit);
+                if (start < 1) start = 1;
+                size_t pos = static_cast<size_t>(start - 1);
+                if (pos >= s.size()) return 0;
+                int64_t len = e.func_arg2
+                    ? eval_arith_vt(*e.func_arg2, src, col_idx, row_idx)
+                    : static_cast<int64_t>(s.size() - pos);
+                std::string sub = s.substr(pos, static_cast<size_t>(len));
+                try { return std::stoll(sub); } catch (...) { return 0; }
+            }
             if (e.func_arg) return eval_arith_vt(*e.func_arg, src, col_idx, row_idx);
             return 0;
     }
@@ -233,12 +246,116 @@ const PipelineStats& QueryExecutor::stats() const {
 // ============================================================================
 // Main execution entry points
 // ============================================================================
+// Build a human-readable query plan for EXPLAIN without executing the query.
+static QueryResultSet build_explain_plan(const SelectStmt& stmt,
+                                          ApexPipeline& pipeline)
+{
+    QueryResultSet result;
+    result.column_names = {"plan"};
+    result.column_types = {ColumnType::INT64};
+
+    auto line = [&](std::string s) {
+        result.string_rows.push_back(std::move(s));
+    };
+
+    // Determine which plan path would be chosen
+    bool has_agg = false;
+    bool has_group = stmt.group_by.has_value();
+    bool has_join  = stmt.join.has_value();
+    for (auto& col : stmt.columns)
+        if (col.agg != AggFunc::NONE) { has_agg = true; break; }
+
+    std::string operation;
+    std::string path_detail;
+    if (has_group) {
+        const auto& gb = stmt.group_by.value();
+        if (gb.columns.size() == 1) {
+            const std::string& gc = gb.columns[0];
+            bool is_sym = (gc == "symbol");
+            operation = is_sym ? "GroupAggregation/SymbolPartition" : "GroupAggregation/SingleCol";
+            if (!is_sym)
+                path_detail = "flat_hash(int64) + sorted-scan-cache + flat_GroupState";
+        } else {
+            operation = "GroupAggregation/MultiCol";
+            path_detail = "VectorHash<vector<int64_t>>";
+        }
+    } else if (has_agg) {
+        operation = "Aggregation";
+        path_detail = "single-pass column scan";
+    } else if (has_join) {
+        operation = "Join";
+        switch (stmt.join->type) {
+            case JoinClause::Type::ASOF:       path_detail = "AsOf binary-search"; break;
+            case JoinClause::Type::AJ0:        path_detail = "AsOf binary-search (left-cols only)"; break;
+            case JoinClause::Type::WINDOW:     path_detail = "Window binary-search O(n log m)"; break;
+            case JoinClause::Type::FULL:       path_detail = "full outer hash join"; break;
+            case JoinClause::Type::UNION_JOIN: path_detail = "union join (kdb+ uj)"; break;
+            case JoinClause::Type::PLUS:       path_detail = "plus join (kdb+ pj)"; break;
+            default:                           path_detail = "hash join"; break;
+        }
+    } else {
+        operation = "TableScan";
+        path_detail = "sequential column read";
+    }
+
+    // Partition info
+    auto& pm = pipeline.partition_manager();
+    size_t total_parts = pm.partition_count();
+    size_t total_rows  = 0;
+    for (auto* p : pm.get_all_partitions())
+        total_rows += p->num_rows();
+
+    line("Operation:  " + operation);
+    if (!path_detail.empty())
+        line("Path:       " + path_detail);
+    line("Table:      " + (stmt.from_table.empty() ? "(subquery)" : stmt.from_table));
+    if (stmt.where.has_value())
+        line("Filter:     (WHERE clause present)");
+    if (has_group) {
+        std::string gb_str;
+        for (auto& c : stmt.group_by->columns) {
+            if (!gb_str.empty()) gb_str += ", ";
+            gb_str += c;
+        }
+        line("GroupBy:    " + gb_str);
+    }
+    std::string agg_list;
+    for (auto& col : stmt.columns) {
+        if (col.agg == AggFunc::NONE) continue;
+        if (!agg_list.empty()) agg_list += ", ";
+        if (!col.alias.empty()) agg_list += col.alias;
+        else if (!col.column.empty()) agg_list += col.column;
+        else agg_list += "*";
+    }
+    if (!agg_list.empty())
+        line("Aggregates: " + agg_list);
+    if (stmt.order_by.has_value())
+        line("OrderBy:    (ORDER BY clause present)");
+    if (stmt.limit.has_value())
+        line("Limit:      " + std::to_string(stmt.limit.value()));
+    line("Partitions: " + std::to_string(total_parts));
+    line("TotalRows:  " + std::to_string(total_rows));
+    if (stmt.group_by.has_value() && stmt.group_by->columns.size() == 1
+        && !stmt.group_by->xbar_buckets.empty())
+        line("XbarBucket: " + std::to_string(stmt.group_by->xbar_buckets[0])
+             + " ns  (sorted-scan-cache active for monotonic timestamps)");
+
+    return result;
+}
+
 QueryResultSet QueryExecutor::execute(const std::string& sql) {
     tl_cte_map.clear();
     double t0 = now_us();
     try {
         Parser parser;
         SelectStmt stmt = parser.parse(sql);
+
+        // EXPLAIN: return query plan without executing
+        if (stmt.explain) {
+            auto result = build_explain_plan(stmt, pipeline_);
+            result.execution_time_us = now_us() - t0;
+            return result;
+        }
 
         // Execute each CTE definition and store result in the thread-local map.
         // Later CTEs may reference earlier ones (they are visible in tl_cte_map).
@@ -368,11 +485,31 @@ QueryResultSet QueryExecutor::exec_select(const SelectStmt& stmt) {
             return exec_asof_join(stmt, left_parts, right_parts);
         }
 
-        // Hash JOIN (INNER / LEFT)
+        // AJ0 JOIN (left-columns-only asof join)
+        if (stmt.join.has_value() && stmt.join->type == JoinClause::Type::AJ0) {
+            auto right_parts = find_partitions(stmt.join->table);
+            return exec_asof_join(stmt, left_parts, right_parts);
+        }
+
+        // Hash JOIN (INNER / LEFT / RIGHT / FULL)
         if (stmt.join.has_value() && (stmt.join->type == JoinClause::Type::INNER
-                                   || stmt.join->type == JoinClause::Type::LEFT)) {
+                                   || stmt.join->type == JoinClause::Type::LEFT
+                                   || stmt.join->type == JoinClause::Type::RIGHT
+                                   || stmt.join->type == JoinClause::Type::FULL)) {
             auto right_parts = find_partitions(stmt.join->table);
             return exec_hash_join(stmt, left_parts, right_parts);
+        }
+
+        // UNION JOIN (kdb+ uj — merge columns from both tables)
+        if (stmt.join.has_value() && stmt.join->type == JoinClause::Type::UNION_JOIN) {
+            auto right_parts = find_partitions(stmt.join->table);
+            return exec_union_join(stmt, left_parts, right_parts);
+        }
+
+        // PLUS JOIN (kdb+ pj — additive join)
+        if (stmt.join.has_value() && stmt.join->type == JoinClause::Type::PLUS) {
+            auto right_parts = find_partitions(stmt.join->table);
+            return exec_plus_join(stmt, left_parts, right_parts);
         }
 
         // WINDOW JOIN (kdb+ wj 스타일)
@@ -415,11 +552,31 @@ QueryResultSet QueryExecutor::exec_select(const SelectStmt& stmt) {
         return exec_asof_join(stmt, left_parts, right_parts);
     }
 
-    // Hash JOIN (INNER / LEFT)
+    // AJ0 JOIN
+    if (stmt.join.has_value() && stmt.join->type == JoinClause::Type::AJ0) {
+        auto right_parts = find_partitions(stmt.join->table);
+        return exec_asof_join(stmt, left_parts, right_parts);
+    }
+
+    // Hash JOIN (INNER / LEFT / RIGHT / FULL)
     if (stmt.join.has_value() && (stmt.join->type == JoinClause::Type::INNER
-                               || stmt.join->type == JoinClause::Type::LEFT)) {
+                               || stmt.join->type == JoinClause::Type::LEFT
+                               || stmt.join->type == JoinClause::Type::RIGHT
+                               || stmt.join->type == JoinClause::Type::FULL)) {
         auto right_parts = find_partitions(stmt.join->table);
         return exec_hash_join(stmt, left_parts, right_parts);
+    }
+
+    // UNION JOIN
+    if (stmt.join.has_value() && stmt.join->type == JoinClause::Type::UNION_JOIN) {
+        auto right_parts = find_partitions(stmt.join->table);
+        return exec_union_join(stmt, left_parts, right_parts);
+    }
+
+    // PLUS JOIN
+    if (stmt.join.has_value() && stmt.join->type == JoinClause::Type::PLUS) {
+        auto right_parts = find_partitions(stmt.join->table);
+        return exec_plus_join(stmt, left_parts, right_parts);
     }
 
     // WINDOW JOIN (kdb+ wj 스타일)
@@ -726,6 +883,73 @@ bool QueryExecutor::extract_time_range(
 }
 
 // ============================================================================
+// extract_sorted_col_range: WHERE conditions on an s#-sorted column
+// ============================================================================
+bool QueryExecutor::extract_sorted_col_range(
+    const SelectStmt& stmt,
+    const Partition& part,
+    std::string& out_col,
+    int64_t& out_lo,
+    int64_t& out_hi) const
+{
+    if (!stmt.where.has_value()) return false;
+
+    struct Bounds {
+        int64_t lo  = INT64_MIN;
+        int64_t hi  = INT64_MAX;
+        bool    set = false;
+    };
+    std::unordered_map<std::string, Bounds> col_bounds;
+
+    std::function<void(const std::shared_ptr<Expr>&)> collect =
+        [&](const std::shared_ptr<Expr>& e) {
+        if (!e) return;
+
+        if (e->kind == Expr::Kind::BETWEEN && part.is_sorted(e->column)) {
+            auto& b = col_bounds[e->column];
+            b.lo  = std::max(b.lo, e->lo);
+            b.hi  = std::min(b.hi, e->hi);
+            b.set = true;
+            return;
+        }
+
+        if (e->kind == Expr::Kind::COMPARE && !e->is_float &&
+            part.is_sorted(e->column)) {
+            auto& b = col_bounds[e->column];
+            switch (e->op) {
+                case CompareOp::GE: b.lo = std::max(b.lo, e->value); b.set = true; break;
+                case CompareOp::GT: b.lo = std::max(b.lo, e->value + 1); b.set = true; break;
+                case CompareOp::LE: b.hi = std::min(b.hi, e->value); b.set = true; break;
+                case CompareOp::LT: b.hi = std::min(b.hi, e->value - 1); b.set = true; break;
+                case CompareOp::EQ:
+                    b.lo = b.hi = e->value;
+                    b.set = true;
+                    break;
+                default: break;  // NE: not optimizable with a single range
+            }
+            return;
+        }
+
+        if (e->kind == Expr::Kind::AND) {
+            collect(e->left);
+            collect(e->right);
+        }
+        // OR / NOT: can't reduce to a single contiguous range — skip
+    };
+    collect(stmt.where->expr);
+
+    for (auto& [col, b] : col_bounds) {
+        if (b.set && (b.lo != INT64_MIN || b.hi != INT64_MAX)) {
+            out_col = col;
+            out_lo  = b.lo;
+            out_hi  = b.hi;
+            return true;
+        }
+    }
+    return false;
+}
+
+// ============================================================================
 // ============================================================================
 // Static helpers: single-row evaluation
 // ============================================================================
@@ -786,6 +1010,19 @@ static int64_t eval_arith(const ArithExpr& node,
             }
             if (node.func_name == "epoch_s")  return arg / 1'000'000'000LL;
             if (node.func_name == "epoch_ms") return arg / 1'000'000LL;
+            if (node.func_name == "substr") {
+                // SUBSTR on int64 column: convert to string, extract substring, convert back
+                std::string s = std::to_string(arg);
+                int64_t start = node.func_unit.empty() ? 1 : std::stoll(node.func_unit);
+                if (start < 1) start = 1;
+                size_t pos = static_cast<size_t>(start - 1); // 1-based → 0-based
+                if (pos >= s.size()) return 0;
+                int64_t len = node.func_arg2
+                    ? eval_arith(*node.func_arg2, part, idx)
+                    : static_cast<int64_t>(s.size() - pos);
+                std::string sub = s.substr(pos, static_cast<size_t>(len));
+                try { return std::stoll(sub); } catch (...) { return 0; }
+            }
             return arg;
         }
     }
@@ -978,9 +1215,9 @@ QueryResultSet QueryExecutor::exec_select_virtual(
             switch (sel.agg) {
                 case AggFunc::COUNT: agg_val = cnt; break;
                 case AggFunc::SUM:   agg_val = static_cast<int64_t>(sum); break;
-                case AggFunc::AVG:   agg_val = cnt ? static_cast<int64_t>(sum / cnt) : 0; break;
-                case AggFunc::MIN:   agg_val = (mn != INT64_MAX) ? mn : 0; break;
-                case AggFunc::MAX:   agg_val = (mx != INT64_MIN) ? mx : 0; break;
+                case AggFunc::AVG:   agg_val = cnt ? static_cast<int64_t>(sum / cnt) : INT64_MIN; break;
+                case AggFunc::MIN:   agg_val = (mn != INT64_MAX) ? mn : INT64_MIN; break;
+                case AggFunc::MAX:   agg_val = mx; break;
                 case AggFunc::FIRST: agg_val = (first != INT64_MIN) ? first : 0; break;
                 case AggFunc::LAST:  agg_val = (last  != INT64_MIN) ? last  : 0; break;
                 default:
@@ -1065,8 +1302,8 @@ QueryResultSet QueryExecutor::exec_select_virtual(
                 case AggFunc::COUNT: v = state.counts[ci]; break;
                 case AggFunc::SUM:   v = static_cast<int64_t>(state.sums[ci]); break;
                 case AggFunc::AVG:   v = state.counts[ci] ? static_cast<int64_t>(state.sums[ci] / state.counts[ci]) : 0; break;
-                case AggFunc::MIN:   v = (state.mins[ci]   != INT64_MAX) ? state.mins[ci]   : 0; break;
-                case AggFunc::MAX:   v = (state.maxs[ci]   != INT64_MIN) ? state.maxs[ci]   : 0; break;
+                case AggFunc::MIN:   v = (state.mins[ci] != INT64_MAX) ? state.mins[ci] : INT64_MIN; break;
+                case AggFunc::MAX:   v = state.maxs[ci]; break;
                 case AggFunc::FIRST: v = (state.firsts[ci] != INT64_MIN) ? state.firsts[ci] : 0; break;
                 case AggFunc::LAST:  v = (state.lasts[ci]  != INT64_MIN) ? state.lasts[ci]  : 0; break;
                 default: {
@@ -1282,6 +1519,17 @@ QueryResultSet QueryExecutor::exec_simple_select(
     const SelectStmt& stmt,
     const std::vector<Partition*>& partitions)
 {
+    // Parallel path
+    if (par_opts_.enabled && pool_raw_ &&
+        pool_raw_->num_threads() > 1 &&
+        estimate_total_rows(partitions) >= par_opts_.row_threshold &&
+        partitions.size() >= 2)
+    {
+        try {
+            return exec_simple_select_parallel(stmt, partitions);
+        } catch (...) {}
+    }
+
     QueryResultSet result;
     size_t rows_scanned = 0;
 
@@ -1321,8 +1569,17 @@ QueryResultSet QueryExecutor::exec_simple_select(
             rows_scanned += r_end - r_begin;
             sel_indices = eval_where_ranged(stmt, *part, r_begin, r_end);
         } else {
-            rows_scanned += n;
-            sel_indices = eval_where(stmt, *part, n);
+            // s# sorted column range optimization
+            std::string sorted_col;
+            int64_t slo = INT64_MIN, shi = INT64_MAX;
+            if (extract_sorted_col_range(stmt, *part, sorted_col, slo, shi)) {
+                auto [r_begin, r_end] = part->sorted_range(sorted_col, slo, shi);
+                rows_scanned += r_end - r_begin;
+                sel_indices = eval_where_ranged(stmt, *part, r_begin, r_end);
+            } else {
+                rows_scanned += n;
+                sel_indices = eval_where(stmt, *part, n);
+            }
         }
 
         // ORDER BY가 있으면 LIMIT은 apply_order_by에서 처리 → 여기서 제한 없이 수집
@@ -1518,18 +1775,18 @@ QueryResultSet QueryExecutor::exec_agg(
             case AggFunc::AVG:
                 row[ci] = cnt[ci] > 0
                     ? static_cast<int64_t>(d_accum[ci] / cnt[ci])
-                    : 0;
+                    : INT64_MIN;
                 break;
             case AggFunc::MIN:
-                row[ci] = (minv[ci] == INT64_MAX) ? 0 : minv[ci];
+                row[ci] = (minv[ci] == INT64_MAX) ? INT64_MIN : minv[ci];
                 break;
             case AggFunc::MAX:
-                row[ci] = (maxv[ci] == INT64_MIN) ? 0 : maxv[ci];
+                row[ci] = (maxv[ci] == INT64_MIN) ? INT64_MIN : maxv[ci];
                 break;
             case AggFunc::VWAP:
                 row[ci] = vwap_v[ci] > 0
                     ? static_cast<int64_t>(vwap_pv[ci] / vwap_v[ci])
-                    : 0;
+                    : INT64_MIN;
                 break;
             case AggFunc::FIRST: row[ci] = first_val[ci]; break;
             case AggFunc::LAST:  row[ci] = last_val[ci];  break;
@@ -1709,12 +1966,12 @@ QueryResultSet QueryExecutor::exec_group_agg(
                         row.push_back(gs.count > 0
                             ? static_cast<int64_t>(gs.avg_sum / gs.count) : 0); break;
                     case AggFunc::MIN:
-                        row.push_back(gs.minv == INT64_MAX ? 0 : gs.minv); break;
+                        row.push_back(gs.minv == INT64_MAX ? INT64_MIN : gs.minv); break;
                     case AggFunc::MAX:
-                        row.push_back(gs.maxv == INT64_MIN ? 0 : gs.maxv); break;
+                        row.push_back(gs.maxv == INT64_MIN ? INT64_MIN : gs.maxv); break;
                     case AggFunc::VWAP:
                         row.push_back(gs.vwap_v > 0
-                            ? static_cast<int64_t>(gs.vwap_pv / gs.vwap_v) : 0); break;
+                            ? static_cast<int64_t>(gs.vwap_pv / gs.vwap_v) : INT64_MIN); break;
                     case AggFunc::FIRST: row.push_back(gs.first_val); break;
                     case AggFunc::LAST:  row.push_back(gs.last_val);  break;
                     case AggFunc::XBAR:  row.push_back(gs.first_val); break;
@@ -1740,7 +1997,187 @@ QueryResultSet QueryExecutor::exec_group_agg(
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // General path: supports multi-column GROUP BY and arith_expr in aggs.
+    // Optimized path 2: single-column GROUP BY (non-symbol).
+    // Uses flat int64_t key → zero per-row heap allocations.
+    // Also hoists column data pointers out of the inner row loop.
+    // Handles XBAR, plain column, and arith_expr group keys.
+    // ─────────────────────────────────────────────────────────────────────
+    if (gb.columns.size() == 1) {
+        const int64_t bucket = gb.xbar_buckets.empty() ? 0 : gb.xbar_buckets[0];
+        const size_t ncols = stmt.columns.size();
+
+        // Flat GroupState: key→slot index map + single contiguous array.
+        // Eliminates per-group vector<GroupState> heap allocations (N_groups × alloc).
+        // flat_states layout: [slot0_col0, slot0_col1, ..., slot1_col0, slot1_col1, ...]
+        std::unordered_map<int64_t, uint32_t> key_to_slot;
+        key_to_slot.reserve(4096);
+        std::vector<GroupState> flat_states;
+        flat_states.reserve(4096 * ncols);
+        uint32_t next_slot = 0;
+
+        // Sorted-scan cache: for XBAR on sorted timestamps, consecutive rows share
+        // the same bucket key.  Cache the last-seen (key, slot) pair so hash lookup
+        // only fires on group-boundary crossings (~N_groups) instead of every row (~N_rows).
+        int64_t  cached_key  = INT64_MIN;
+        uint32_t cached_slot = 0;
+
+        for (auto* part : partitions) {
+            if (is_cancelled()) { QueryResultSet r; r.error = "Query cancelled"; return r; }
+            size_t n = part->num_rows();
+
+            std::vector<uint32_t> sel_indices;
+            if (use_ts_index) {
+                if (!part->overlaps_time_range(ts_lo, ts_hi)) continue;
+                auto [r_begin, r_end] = part->timestamp_range(ts_lo, ts_hi);
+                rows_scanned += r_end - r_begin;
+                sel_indices = eval_where_ranged(stmt, *part, r_begin, r_end);
+            } else {
+                rows_scanned += n;
+                sel_indices = eval_where(stmt, *part, n);
+            }
+
+            // Hoist group key column pointer (symbol handled inline)
+            const int64_t* gkey_col = (group_col == "symbol")
+                ? nullptr : get_col_data(*part, group_col);
+            const int64_t symbol_kv = static_cast<int64_t>(part->key().symbol_id);
+
+            // Hoist aggregate column pointers to partition scope
+            std::vector<const int64_t*> col_ptrs(ncols, nullptr);
+            std::vector<const int64_t*> vwap_ptrs(ncols, nullptr);
+            for (size_t ci = 0; ci < ncols; ++ci) {
+                const auto& col = stmt.columns[ci];
+                if (col.agg == AggFunc::NONE || col.arith_expr) continue;
+                col_ptrs[ci] = get_col_data(*part, col.column);
+                if (col.agg == AggFunc::VWAP)
+                    vwap_ptrs[ci] = get_col_data(*part, col.agg_arg2);
+            }
+
+            for (auto idx : sel_indices) {
+                // Compute flat int64_t key — no heap allocation
+                int64_t kv = gkey_col ? gkey_col[idx] : symbol_kv;
+                if (bucket > 0) kv = (kv / bucket) * bucket;
+
+                // Sorted-scan fast path: skip hash lookup when key unchanged.
+                if (__builtin_expect(kv != cached_key, 0)) {
+                    auto it = key_to_slot.find(kv);
+                    if (__builtin_expect(it == key_to_slot.end(), 0)) {
+                        it = key_to_slot.emplace(kv, next_slot++).first;
+                        flat_states.resize(flat_states.size() + ncols);
+                    }
+                    cached_key  = kv;
+                    cached_slot = it->second;
+                }
+                GroupState* states = flat_states.data() + cached_slot * ncols;
+
+                for (size_t ci = 0; ci < ncols; ++ci) {
+                    const auto& col = stmt.columns[ci];
+                    auto& gs = states[ci];
+                    if (col.agg == AggFunc::NONE) continue;
+                    const int64_t* data = col_ptrs[ci];
+                    auto agg_v = [&]() -> int64_t {
+                        if (col.arith_expr) return eval_arith(*col.arith_expr, *part, idx);
+                        return data ? data[idx] : 0;
+                    };
+                    switch (col.agg) {
+                        case AggFunc::COUNT: gs.count++; break;
+                        case AggFunc::SUM:   gs.sum += agg_v(); break;
+                        case AggFunc::AVG:   gs.avg_sum += agg_v(); gs.count++; break;
+                        case AggFunc::MIN:   gs.minv = std::min(gs.minv, agg_v()); break;
+                        case AggFunc::MAX:   gs.maxv = std::max(gs.maxv, agg_v()); break;
+                        case AggFunc::FIRST: {
+                            int64_t v = agg_v();
+                            if (!gs.has_first) { gs.first_val = v; gs.has_first = true; }
+                            gs.last_val = v;
+                            break;
+                        }
+                        case AggFunc::LAST: {
+                            int64_t v = agg_v();
+                            if (!gs.has_first) { gs.first_val = v; gs.has_first = true; }
+                            gs.last_val = v;
+                            break;
+                        }
+                        case AggFunc::XBAR:
+                            if (!gs.has_first) {
+                                int64_t v = data ? data[idx] : 0;
+                                int64_t b = col.xbar_bucket;
+                                gs.first_val = b > 0 ? (v / b) * b : v;
+                                gs.has_first = true;
+                            }
+                            break;
+                        case AggFunc::VWAP: {
+                            const int64_t* vd = vwap_ptrs[ci];
+                            if (data && vd) {
+                                gs.vwap_pv += static_cast<double>(data[idx])
+                                            * static_cast<double>(vd[idx]);
+                                gs.vwap_v  += vd[idx];
+                            }
+                            break;
+                        }
+                        case AggFunc::NONE: break;
+                    }
+                }
+            }
+        }
+
+        // Output column names
+        result.column_names.push_back(group_col);
+        result.column_types.push_back(ColumnType::INT64);
+        for (size_t ci = 0; ci < stmt.columns.size(); ++ci) {
+            const auto& col = stmt.columns[ci];
+            if (col.agg == AggFunc::NONE) continue;
+            std::string name = col.alias.empty()
+                ? (col.arith_expr ? "expr" : (col.column.empty() ? "*" : col.column))
+                : col.alias;
+            result.column_names.push_back(name);
+            result.column_types.push_back(ColumnType::INT64);
+        }
+
+        for (auto& [gkey_scalar, slot] : key_to_slot) {
+            std::vector<int64_t> row;
+            row.push_back(gkey_scalar);
+            const GroupState* states = flat_states.data() + slot * ncols;
+            for (size_t ci = 0; ci < stmt.columns.size(); ++ci) {
+                const auto& col = stmt.columns[ci];
+                if (col.agg == AggFunc::NONE) continue;
+                const auto& gs = states[ci];
+                switch (col.agg) {
+                    case AggFunc::COUNT: row.push_back(gs.count); break;
+                    case AggFunc::SUM:   row.push_back(gs.sum);   break;
+                    case AggFunc::AVG:
+                        row.push_back(gs.count > 0
+                            ? static_cast<int64_t>(gs.avg_sum / gs.count) : 0);
+                        break;
+                    case AggFunc::MIN:
+                        row.push_back(gs.minv == INT64_MAX ? INT64_MIN : gs.minv);
+                        break;
+                    case AggFunc::MAX:
+                        row.push_back(gs.maxv == INT64_MIN ? INT64_MIN : gs.maxv);
+                        break;
+                    case AggFunc::VWAP:
+                        row.push_back(gs.vwap_v > 0
+                            ? static_cast<int64_t>(gs.vwap_pv / gs.vwap_v) : INT64_MIN);
+                        break;
+                    case AggFunc::FIRST: row.push_back(gs.first_val); break;
+                    case AggFunc::LAST:  row.push_back(gs.last_val);  break;
+                    case AggFunc::XBAR:  row.push_back(gs.first_val); break;
+                    case AggFunc::NONE:  break;
+                }
+            }
+            result.rows.push_back(std::move(row));
+        }
+
+        result.rows_scanned = rows_scanned;
+        if (stmt.having.has_value())
+            result = apply_having_filter(std::move(result), stmt.having.value());
+        apply_order_by(result, stmt);
+        if (!stmt.order_by.has_value() &&
+            stmt.limit.has_value() && result.rows.size() > (size_t)stmt.limit.value())
+            result.rows.resize(stmt.limit.value());
+        return result;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // General path: multi-column GROUP BY.
     // Composite key: std::vector<int64_t> with VectorHash.
     // ─────────────────────────────────────────────────────────────────────
     std::unordered_map<std::vector<int64_t>, std::vector<GroupState>, VectorHash> groups;
@@ -1871,14 +2308,14 @@ QueryResultSet QueryExecutor::exec_group_agg(
                         ? static_cast<int64_t>(gs.avg_sum / gs.count) : 0);
                     break;
                 case AggFunc::MIN:
-                    row.push_back(gs.minv == INT64_MAX ? 0 : gs.minv);
+                    row.push_back(gs.minv == INT64_MAX ? INT64_MIN : gs.minv);
                     break;
                 case AggFunc::MAX:
-                    row.push_back(gs.maxv == INT64_MIN ? 0 : gs.maxv);
+                    row.push_back(gs.maxv == INT64_MIN ? INT64_MIN : gs.maxv);
                     break;
                 case AggFunc::VWAP:
                     row.push_back(gs.vwap_v > 0
-                        ? static_cast<int64_t>(gs.vwap_pv / gs.vwap_v) : 0);
+                        ? static_cast<int64_t>(gs.vwap_pv / gs.vwap_v) : INT64_MIN);
                     break;
                 case AggFunc::FIRST: row.push_back(gs.first_val); break;
                 case AggFunc::LAST:  row.push_back(gs.last_val);  break;
@@ -1959,6 +2396,7 @@ QueryResultSet QueryExecutor::exec_asof_join(
 
     const std::string l_alias = stmt.from_alias;
     const std::string r_alias = stmt.join->alias;
+    const bool aj0_mode = (stmt.join->type == JoinClause::Type::AJ0);
 
     for (const auto& sel : stmt.columns) {
         if (sel.is_star) {
@@ -1968,6 +2406,9 @@ QueryResultSet QueryExecutor::exec_asof_join(
             }
             continue;
         }
+        // AJ0: skip right-table columns
+        if (aj0_mode && !sel.table_alias.empty() && sel.table_alias == r_alias)
+            continue;
         result.column_names.push_back(
             sel.alias.empty() ? sel.column : sel.alias);
         result.column_types.push_back(ColumnType::INT64);
@@ -1988,6 +2429,8 @@ QueryResultSet QueryExecutor::exec_asof_join(
                 continue;
             }
             bool is_right = (!sel.table_alias.empty() && sel.table_alias == r_alias);
+            // AJ0: skip right-table columns
+            if (aj0_mode && is_right) continue;
             if (is_right && ri >= 0) {
                 const int64_t* d = get_col_data(*rp, sel.column);
                 row.push_back(d ? d[ri] : 0);
@@ -2077,24 +2520,72 @@ QueryResultSet QueryExecutor::exec_hash_join(
     }
 
     // 매칭 인덱스 쌍 생성
-    // LEFT JOIN: 매칭 없는 왼쪽 행은 r_index = SIZE_MAX (NULL 표시)
-    bool is_left_join = (stmt.join->type == JoinClause::Type::LEFT);
-    std::vector<size_t> matched_l;
-    std::vector<size_t> matched_r; // SIZE_MAX = NULL (LEFT JOIN 전용)
+    // LEFT JOIN:  unmatched left  rows → r_index = SIZE_MAX (right  NULL)
+    // RIGHT JOIN: unmatched right rows → l_index = SIZE_MAX (left NULL)
+    // FULL JOIN:  both unmatched sides included
+    bool is_left_join  = (stmt.join->type == JoinClause::Type::LEFT);
+    bool is_right_join = (stmt.join->type == JoinClause::Type::RIGHT);
+    bool is_full_join  = (stmt.join->type == JoinClause::Type::FULL);
+    std::vector<size_t> matched_l; // SIZE_MAX = left-side NULL (RIGHT JOIN)
+    std::vector<size_t> matched_r; // SIZE_MAX = right-side NULL (LEFT JOIN)
 
-    for (size_t li = 0; li < l_keys_flat.size(); ++li) {
-        auto it = hash_map.find(l_keys_flat[li]);
-        if (it == hash_map.end()) {
-            if (is_left_join) {
-                // LEFT JOIN: 오른쪽 NULL로 포함
-                matched_l.push_back(li);
-                matched_r.push_back(SIZE_MAX); // NULL 센티넬
+    if (is_right_join) {
+        // RIGHT JOIN: build hash on left, iterate right
+        std::unordered_map<int64_t, std::vector<size_t>> l_map;
+        l_map.reserve(l_keys_flat.size() * 2);
+        for (size_t li = 0; li < l_keys_flat.size(); ++li)
+            l_map[l_keys_flat[li]].push_back(li);
+
+        for (size_t ri = 0; ri < r_keys_flat.size(); ++ri) {
+            auto it = l_map.find(r_keys_flat[ri]);
+            if (it == l_map.end()) {
+                matched_l.push_back(SIZE_MAX); // left NULL
+                matched_r.push_back(ri);
+                continue;
             }
-            continue;
+            for (size_t li : it->second) {
+                matched_l.push_back(li);
+                matched_r.push_back(ri);
+            }
         }
-        for (size_t ri : it->second) {
-            matched_l.push_back(li);
-            matched_r.push_back(ri);
+    } else if (is_full_join) {
+        // FULL OUTER JOIN: LEFT JOIN + unmatched right rows
+        std::vector<bool> right_matched(r_keys_flat.size(), false);
+        for (size_t li = 0; li < l_keys_flat.size(); ++li) {
+            auto it = hash_map.find(l_keys_flat[li]);
+            if (it == hash_map.end()) {
+                matched_l.push_back(li);
+                matched_r.push_back(SIZE_MAX); // right NULL
+                continue;
+            }
+            for (size_t ri : it->second) {
+                matched_l.push_back(li);
+                matched_r.push_back(ri);
+                right_matched[ri] = true;
+            }
+        }
+        // Append unmatched right rows
+        for (size_t ri = 0; ri < r_keys_flat.size(); ++ri) {
+            if (!right_matched[ri]) {
+                matched_l.push_back(SIZE_MAX); // left NULL
+                matched_r.push_back(ri);
+            }
+        }
+    } else {
+        // INNER / LEFT: iterate left rows, probe right hash map
+        for (size_t li = 0; li < l_keys_flat.size(); ++li) {
+            auto it = hash_map.find(l_keys_flat[li]);
+            if (it == hash_map.end()) {
+                if (is_left_join) {
+                    matched_l.push_back(li);
+                    matched_r.push_back(SIZE_MAX); // right NULL
+                }
+                continue;
+            }
+            for (size_t ri : it->second) {
+                matched_l.push_back(li);
+                matched_r.push_back(ri);
+            }
         }
     }
 
@@ -2119,39 +2610,227 @@ QueryResultSet QueryExecutor::exec_hash_join(
     // ── 결과 행 조립 ──
     size_t limit = stmt.limit.value_or(INT64_MAX);
     for (size_t m = 0; m < matched_l.size() && result.rows.size() < limit; ++m) {
-        const RowRef& lr = l_refs[matched_l[m]];
-        bool right_null = (matched_r[m] == SIZE_MAX); // LEFT JOIN에서 오른쪽 없음
-        auto* lp = left_parts[lr.part_idx];
+        bool left_null  = (matched_l[m] == SIZE_MAX); // RIGHT JOIN: 왼쪽 없음
+        bool right_null = (matched_r[m] == SIZE_MAX); // LEFT  JOIN: 오른쪽 없음
+
+        auto* lp = (!left_null) ? left_parts[l_refs[matched_l[m]].part_idx] : nullptr;
         Partition* rp = nullptr;
-        RowRef rr{0, 0};
-        if (!right_null) {
-            rr = r_refs[matched_r[m]];
-            rp = right_parts[rr.part_idx];
-        }
+        RowRef lr{0, 0}, rr{0, 0};
+        if (!left_null)  lr = l_refs[matched_l[m]];
+        if (!right_null) { rr = r_refs[matched_r[m]]; rp = right_parts[rr.part_idx]; }
 
         std::vector<int64_t> row;
         for (const auto& sel : stmt.columns) {
             if (sel.is_star) {
-                for (const auto& cv : lp->columns()) {
-                    const int64_t* d = static_cast<const int64_t*>(cv->raw_data());
-                    row.push_back(d ? d[lr.local_idx] : 0);
+                // star expands left table columns
+                auto* star_part = lp ? lp : (!right_parts.empty() ? left_parts[0] : nullptr);
+                if (star_part) {
+                    for (const auto& cv : star_part->columns()) {
+                        if (left_null) { row.push_back(JOIN_NULL); continue; }
+                        const int64_t* d = static_cast<const int64_t*>(cv->raw_data());
+                        row.push_back(d ? d[lr.local_idx] : 0);
+                    }
                 }
                 continue;
             }
             bool is_right = (!sel.table_alias.empty() && sel.table_alias == r_alias);
             if (is_right) {
                 if (right_null || !rp) {
-                    row.push_back(JOIN_NULL); // NULL 센티넬 (INT64_MIN)
+                    row.push_back(JOIN_NULL); // NULL sentinel (INT64_MIN)
                 } else {
                     const int64_t* d = get_col_data(*rp, sel.column);
                     row.push_back(d ? d[rr.local_idx] : 0);
                 }
             } else {
-                const int64_t* d = get_col_data(*lp, sel.column);
-                row.push_back(d ? d[lr.local_idx] : 0);
+                if (left_null || !lp) {
+                    row.push_back(JOIN_NULL); // NULL sentinel (INT64_MIN)
+                } else {
+                    const int64_t* d = get_col_data(*lp, sel.column);
+                    row.push_back(d ? d[lr.local_idx] : 0);
+                }
             }
         }
         result.rows.push_back(std::move(row));
+    }
+
+    result.rows_scanned = rows_scanned;
+    return result;
+}
+
+// ============================================================================
+// UNION JOIN 실행 (kdb+ uj — merge columns from both tables, concatenate rows)
+// ============================================================================
+// kdb+ uj: union join — merge two tables with matching columns.
+// Matching columns are merged; non-matching columns get JOIN_NULL for missing side.
+// All rows from both tables appear in the result.
+// ============================================================================
+QueryResultSet QueryExecutor::exec_union_join(
+    const SelectStmt& stmt,
+    const std::vector<Partition*>& left_parts,
+    const std::vector<Partition*>& right_parts)
+{
+    QueryResultSet result;
+    size_t rows_scanned = 0;
+
+    // Collect all column names from both sides (union of columns)
+    std::vector<std::string> all_cols;
+    std::unordered_map<std::string, size_t> col_idx;
+
+    auto add_col = [&](const std::string& name) {
+        if (col_idx.find(name) == col_idx.end()) {
+            col_idx[name] = all_cols.size();
+            all_cols.push_back(name);
+        }
+    };
+
+    // Gather column names from left partitions
+    std::vector<std::string> left_cols, right_cols;
+    if (!left_parts.empty()) {
+        for (const auto& cv : left_parts[0]->columns()) {
+            left_cols.push_back(cv->name());
+            add_col(cv->name());
+        }
+    }
+    if (!right_parts.empty()) {
+        for (const auto& cv : right_parts[0]->columns()) {
+            right_cols.push_back(cv->name());
+            add_col(cv->name());
+        }
+    }
+
+    result.column_names = all_cols;
+    result.column_types.resize(all_cols.size(), ColumnType::INT64);
+
+    // Emit left rows
+    for (auto* part : left_parts) {
+        size_t n = part->num_rows();
+        rows_scanned += n;
+        for (size_t r = 0; r < n; ++r) {
+            std::vector<int64_t> row(all_cols.size(), JOIN_NULL);
+            for (const auto& c : left_cols) {
+                const int64_t* d = get_col_data(*part, c);
+                if (d) row[col_idx[c]] = d[r];
+            }
+            // symbol column
+            auto sym_it = col_idx.find("symbol");
+            if (sym_it != col_idx.end())
+                row[sym_it->second] = static_cast<int64_t>(part->key().symbol_id);
+            result.rows.push_back(std::move(row));
+        }
+    }
+
+    // Emit right rows
+    for (auto* part : right_parts) {
+        size_t n = part->num_rows();
+        rows_scanned += n;
+        for (size_t r = 0; r < n; ++r) {
+            std::vector<int64_t> row(all_cols.size(), JOIN_NULL);
+            for (const auto& c : right_cols) {
+                const int64_t* d = get_col_data(*part, c);
+                if (d) row[col_idx[c]] = d[r];
+            }
+            auto sym_it = col_idx.find("symbol");
+            if (sym_it != col_idx.end())
+                row[sym_it->second] = static_cast<int64_t>(part->key().symbol_id);
+            result.rows.push_back(std::move(row));
+        }
+    }
+
+    result.rows_scanned = rows_scanned;
+    return result;
+}
+
+// ============================================================================
+// PLUS JOIN 실행 (kdb+ pj — additive join on matching keys)
+// ============================================================================
+// kdb+ pj: for each left row, find matching right row by key.
+// Numeric columns from right are ADDED to left (not replaced).
+// Non-matching left rows pass through unchanged.
+// ============================================================================
+QueryResultSet QueryExecutor::exec_plus_join(
+    const SelectStmt& stmt,
+    const std::vector<Partition*>& left_parts,
+    const std::vector<Partition*>& right_parts)
+{
+    QueryResultSet result;
+    size_t rows_scanned = 0;
+
+    if (left_parts.empty()) return result;
+
+    // Extract equi-join key column
+    std::string l_key_col, r_key_col;
+    for (const auto& cond : stmt.join->on_conditions) {
+        if (cond.op == CompareOp::EQ) {
+            l_key_col = cond.left_col;
+            r_key_col = cond.right_col;
+            break;
+        }
+    }
+    if (l_key_col.empty()) l_key_col = "symbol";
+    if (r_key_col.empty()) r_key_col = "symbol";
+
+    // Build right-side hash map: key → row data {col_name → value}
+    // For pj, we only need the additive columns (non-key columns from right)
+    std::vector<std::string> r_add_cols; // right columns to add (excluding key)
+    if (!right_parts.empty()) {
+        for (const auto& cv : right_parts[0]->columns()) {
+            if (cv->name() != r_key_col)
+                r_add_cols.push_back(cv->name());
+        }
+    }
+
+    // Build hash: right_key → vector of {col_values}
+    std::unordered_map<int64_t, std::vector<int64_t>> right_map;
+    for (auto* part : right_parts) {
+        size_t n = part->num_rows();
+        rows_scanned += n;
+        const int64_t* rk = get_col_data(*part, r_key_col);
+        if (!rk) continue;
+        for (size_t r = 0; r < n; ++r) {
+            std::vector<int64_t> vals;
+            for (const auto& c : r_add_cols) {
+                const int64_t* d = get_col_data(*part, c);
+                vals.push_back(d ? d[r] : 0);
+            }
+            right_map[rk[r]] = std::move(vals); // last wins for duplicate keys
+        }
+    }
+
+    // Result columns: left columns (values += right matching columns where names overlap)
+    if (!left_parts.empty()) {
+        for (const auto& cv : left_parts[0]->columns()) {
+            result.column_names.push_back(cv->name());
+            result.column_types.push_back(cv->type());
+        }
+    }
+
+    // Map: left col name → index in r_add_cols (for additive merge)
+    std::unordered_map<std::string, size_t> r_col_idx;
+    for (size_t i = 0; i < r_add_cols.size(); ++i)
+        r_col_idx[r_add_cols[i]] = i;
+
+    // Emit left rows with additive merge
+    for (auto* part : left_parts) {
+        size_t n = part->num_rows();
+        rows_scanned += n;
+        const int64_t* lk = get_col_data(*part, l_key_col);
+        for (size_t r = 0; r < n; ++r) {
+            std::vector<int64_t> row;
+            int64_t key_val = lk ? lk[r] : 0;
+            auto rit = right_map.find(key_val);
+            for (const auto& cv : part->columns()) {
+                const int64_t* d = static_cast<const int64_t*>(cv->raw_data());
+                int64_t val = d ? d[r] : 0;
+                // If this column exists in right and we have a match, add
+                if (rit != right_map.end()) {
+                    auto ci = r_col_idx.find(cv->name());
+                    if (ci != r_col_idx.end())
+                        val += rit->second[ci->second];
+                }
+                row.push_back(val);
+            }
+            result.rows.push_back(std::move(row));
+        }
     }
 
     result.rows_scanned = rows_scanned;
@@ -2478,7 +3157,29 @@ QueryResultSet QueryExecutor::exec_agg_parallel(
         partitions.size(), total_rows, n_threads, par_opts_.row_threshold);
 
     if (mode == ParallelMode::SERIAL) {
-        return exec_agg(stmt, partitions); // 재귀 방지를 위해 직렬 실행
+        return exec_agg(stmt, partitions);
+    }
+
+    // CHUNKED: single large partition → split into row ranges
+    // PARTITION: multiple partitions → split into partition chunks
+    // Both use the same worker; CHUNKED creates N copies of the single partition
+    // with row_begin/row_end limits per thread.
+    struct ChunkInfo {
+        std::vector<Partition*> parts;
+        size_t row_begin = 0;
+        size_t row_end   = SIZE_MAX;
+    };
+
+    std::vector<ChunkInfo> work_items;
+    if (mode == ParallelMode::CHUNKED && partitions.size() == 1) {
+        auto ranges = ParallelScanExecutor::make_row_chunks(
+            partitions[0]->num_rows(), n_threads);
+        for (auto& [rb, re] : ranges)
+            work_items.push_back({{partitions[0]}, rb, re});
+    } else {
+        auto chunks = ParallelScanExecutor::make_partition_chunks(partitions, n_threads);
+        for (auto& c : chunks)
+            work_items.push_back({std::move(c), 0, SIZE_MAX});
     }
 
     // 타임스탬프 범위 최적화
@@ -2517,19 +3218,34 @@ QueryResultSet QueryExecutor::exec_agg_parallel(
         return p;
     };
 
-    auto chunks = ParallelScanExecutor::make_partition_chunks(
-        partitions,
-        (mode == ParallelMode::PARTITION) ? n_threads : 1);
+    auto chunks_for_par = ParallelScanExecutor::make_partition_chunks(
+        partitions, n_threads);
+
+    // For CHUNKED mode, we need row ranges per thread
+    std::vector<std::pair<size_t,size_t>> row_ranges;
+    bool is_chunked = (mode == ParallelMode::CHUNKED && partitions.size() == 1);
+    if (is_chunked) {
+        row_ranges = ParallelScanExecutor::make_row_chunks(
+            partitions[0]->num_rows(), n_threads);
+        // Override chunks: each thread gets the same single partition
+        chunks_for_par.clear();
+        for (size_t i = 0; i < row_ranges.size(); ++i)
+            chunks_for_par.push_back({partitions[0]});
+    }
 
     auto partials = pse.parallel_for_chunks<PartialAgg>(
-        chunks,
+        chunks_for_par,
         init_partial,
-        [&](const std::vector<Partition*>& chunk, size_t /*tid*/, PartialAgg& pa) {
+        [&, is_chunked](const std::vector<Partition*>& chunk, size_t tid, PartialAgg& pa) {
             for (auto* part : chunk) {
                 size_t n = part->num_rows();
 
                 std::vector<uint32_t> sel_indices;
-                if (use_ts_index) {
+                if (is_chunked && tid < row_ranges.size()) {
+                    auto [rb, re] = row_ranges[tid];
+                    pa.rows_scanned += re - rb;
+                    sel_indices = eval_where_ranged(stmt, *part, rb, re);
+                } else if (use_ts_index) {
                     if (!part->overlaps_time_range(ts_lo, ts_hi)) continue;
                     auto [r_begin, r_end] = part->timestamp_range(ts_lo, ts_hi);
                     pa.rows_scanned += r_end - r_begin;
@@ -2642,17 +3358,17 @@ QueryResultSet QueryExecutor::exec_agg_parallel(
             case AggFunc::SUM:   row[ci] = merged.sum[ci]; break;
             case AggFunc::AVG:
                 row[ci] = merged.cnt[ci] > 0
-                    ? static_cast<int64_t>(merged.d_sum[ci] / merged.cnt[ci]) : 0;
+                    ? static_cast<int64_t>(merged.d_sum[ci] / merged.cnt[ci]) : INT64_MIN;
                 break;
             case AggFunc::MIN:
-                row[ci] = (merged.minv[ci] == INT64_MAX) ? 0 : merged.minv[ci];
+                row[ci] = (merged.minv[ci] == INT64_MAX) ? INT64_MIN : merged.minv[ci];
                 break;
             case AggFunc::MAX:
-                row[ci] = (merged.maxv[ci] == INT64_MIN) ? 0 : merged.maxv[ci];
+                row[ci] = (merged.maxv[ci] == INT64_MIN) ? INT64_MIN : merged.maxv[ci];
                 break;
             case AggFunc::VWAP:
                 row[ci] = merged.vwap_v[ci] > 0
-                    ? static_cast<int64_t>(merged.vwap_pv[ci] / merged.vwap_v[ci]) : 0;
+                    ? static_cast<int64_t>(merged.vwap_pv[ci] / merged.vwap_v[ci]) : INT64_MIN;
                 break;
             case AggFunc::FIRST: row[ci] = merged.first_val[ci]; break;
             case AggFunc::LAST:  row[ci] = merged.last_val[ci];  break;
@@ -2711,6 +3427,223 @@ QueryResultSet QueryExecutor::exec_group_agg_parallel(
         bool     has_first = false;
     };
 
+    // ─────────────────────────────────────────────────────────────────────
+    // Parallel optimized path: single-column GROUP BY.
+    // Uses flat int64_t key per row — zero heap alloc per row.
+    // ─────────────────────────────────────────────────────────────────────
+    if (gb.columns.size() == 1) {
+        const std::string& group_col_p  = gb.columns[0];
+        const int64_t      bucket_p     = gb.xbar_buckets.empty() ? 0 : gb.xbar_buckets[0];
+
+        // Flat GroupState per thread: key→slot + contiguous array.
+        // Eliminates per-group vector<GroupState> heap allocs in each thread.
+        struct PartialGroupScalar {
+            std::unordered_map<int64_t, uint32_t> key_to_slot;
+            std::vector<GroupState> flat_states;  // ncols * num_groups
+            size_t rows_scanned = 0;
+        };
+
+        auto chunks = ParallelScanExecutor::make_partition_chunks(
+            partitions,
+            (mode == ParallelMode::PARTITION) ? n_threads : 1);
+
+        auto partials = pse.parallel_for_chunks<PartialGroupScalar>(
+            chunks,
+            []() -> PartialGroupScalar { return {}; },
+            [&](const std::vector<Partition*>& chunk, size_t /*tid*/, PartialGroupScalar& pg) {
+                pg.key_to_slot.reserve(4096);
+                pg.flat_states.reserve(4096 * ncols);
+                uint32_t pg_next_slot = 0;
+                int64_t  pg_cached_key  = INT64_MIN;
+                uint32_t pg_cached_slot = 0;
+                for (auto* part : chunk) {
+                    size_t n = part->num_rows();
+                    std::vector<uint32_t> sel_indices;
+                    if (use_ts_index) {
+                        if (!part->overlaps_time_range(ts_lo, ts_hi)) continue;
+                        auto [rb, re] = part->timestamp_range(ts_lo, ts_hi);
+                        pg.rows_scanned += re - rb;
+                        sel_indices = eval_where_ranged(stmt, *part, rb, re);
+                    } else {
+                        pg.rows_scanned += n;
+                        sel_indices = eval_where(stmt, *part, n);
+                    }
+
+                    // Hoist key column + aggregate column pointers to partition scope
+                    const int64_t* gkey_col = (group_col_p == "symbol")
+                        ? nullptr : get_col_data(*part, group_col_p);
+                    const int64_t sym_kv = static_cast<int64_t>(part->key().symbol_id);
+
+                    std::vector<const int64_t*> col_ptrs(ncols, nullptr);
+                    std::vector<const int64_t*> vwap_ptrs(ncols, nullptr);
+                    for (size_t ci = 0; ci < ncols; ++ci) {
+                        const auto& col = stmt.columns[ci];
+                        if (col.agg == AggFunc::NONE || col.arith_expr) continue;
+                        col_ptrs[ci]  = get_col_data(*part, col.column);
+                        if (col.agg == AggFunc::VWAP)
+                            vwap_ptrs[ci] = get_col_data(*part, col.agg_arg2);
+                    }
+
+                    for (auto idx : sel_indices) {
+                        int64_t kv = gkey_col ? gkey_col[idx] : sym_kv;
+                        if (bucket_p > 0) kv = (kv / bucket_p) * bucket_p;
+
+                        if (__builtin_expect(kv != pg_cached_key, 0)) {
+                            auto it = pg.key_to_slot.find(kv);
+                            if (__builtin_expect(it == pg.key_to_slot.end(), 0)) {
+                                it = pg.key_to_slot.emplace(kv, pg_next_slot++).first;
+                                pg.flat_states.resize(pg.flat_states.size() + ncols);
+                            }
+                            pg_cached_key  = kv;
+                            pg_cached_slot = it->second;
+                        }
+                        GroupState* states = pg.flat_states.data() + pg_cached_slot * ncols;
+
+                        for (size_t ci = 0; ci < ncols; ++ci) {
+                            const auto& col = stmt.columns[ci];
+                            if (col.agg == AggFunc::NONE) continue;
+                            auto& gs = states[ci];
+                            const int64_t* data = col_ptrs[ci];
+                            auto agg_v = [&]() -> int64_t {
+                                if (col.arith_expr) return eval_arith(*col.arith_expr, *part, idx);
+                                return data ? data[idx] : 0;
+                            };
+                            switch (col.agg) {
+                                case AggFunc::COUNT: gs.count++; break;
+                                case AggFunc::SUM:   gs.sum += agg_v(); break;
+                                case AggFunc::AVG:   gs.avg_sum += agg_v(); gs.count++; break;
+                                case AggFunc::MIN:   gs.minv = std::min(gs.minv, agg_v()); break;
+                                case AggFunc::MAX:   gs.maxv = std::max(gs.maxv, agg_v()); break;
+                                case AggFunc::FIRST:
+                                case AggFunc::LAST: {
+                                    int64_t v = agg_v();
+                                    if (!gs.has_first) { gs.first_val = v; gs.has_first = true; }
+                                    gs.last_val = v;
+                                    break;
+                                }
+                                case AggFunc::XBAR:
+                                    if (!gs.has_first) {
+                                        int64_t v = data ? data[idx] : 0;
+                                        int64_t b = col.xbar_bucket;
+                                        gs.first_val = b > 0 ? (v / b) * b : v;
+                                        gs.has_first = true;
+                                    }
+                                    break;
+                                case AggFunc::VWAP: {
+                                    const int64_t* vd = vwap_ptrs[ci];
+                                    if (data && vd) {
+                                        gs.vwap_pv += static_cast<double>(data[idx])
+                                                    * static_cast<double>(vd[idx]);
+                                        gs.vwap_v  += vd[idx];
+                                    }
+                                    break;
+                                }
+                                case AggFunc::NONE: break;
+                            }
+                        }
+                    }
+                }
+            }
+        );
+
+        // Merge partial flat maps into single flat structure
+        std::unordered_map<int64_t, uint32_t> merged_key_to_slot;
+        std::vector<GroupState> merged_flat;
+        size_t rows_scanned = 0;
+        merged_key_to_slot.reserve(4096);
+        merged_flat.reserve(4096 * ncols);
+        uint32_t merged_next_slot = 0;
+        for (auto& pg : partials) {
+            rows_scanned += pg.rows_scanned;
+            for (auto& [gk, src_slot] : pg.key_to_slot) {
+                auto mit = merged_key_to_slot.find(gk);
+                bool inserted = (mit == merged_key_to_slot.end());
+                if (inserted) {
+                    mit = merged_key_to_slot.emplace(gk, merged_next_slot++).first;
+                    merged_flat.resize(merged_flat.size() + ncols);
+                }
+                GroupState* dst = merged_flat.data() + mit->second * ncols;
+                const GroupState* src = pg.flat_states.data() + src_slot * ncols;
+                if (inserted) {
+                    // First occurrence — copy directly
+                    std::copy(src, src + ncols, dst);
+                    continue;
+                }
+                for (size_t ci = 0; ci < ncols; ++ci) {
+                    const auto& col = stmt.columns[ci];
+                    if (col.agg == AggFunc::NONE) continue;
+                    auto& d = dst[ci];
+                    const auto& s = src[ci];
+                    switch (col.agg) {
+                        case AggFunc::COUNT: d.count   += s.count; break;
+                        case AggFunc::SUM:   d.sum     += s.sum; break;
+                        case AggFunc::AVG:   d.avg_sum += s.avg_sum; d.count += s.count; break;
+                        case AggFunc::MIN:   d.minv     = std::min(d.minv, s.minv); break;
+                        case AggFunc::MAX:   d.maxv     = std::max(d.maxv, s.maxv); break;
+                        case AggFunc::VWAP:  d.vwap_pv += s.vwap_pv; d.vwap_v += s.vwap_v; break;
+                        case AggFunc::FIRST:
+                        case AggFunc::LAST:
+                            if (!d.has_first && s.has_first) { d.first_val = s.first_val; d.has_first = true; }
+                            if (s.has_first) d.last_val = s.last_val;
+                            break;
+                        case AggFunc::XBAR:
+                            if (!d.has_first && s.has_first) { d.first_val = s.first_val; d.has_first = true; }
+                            break;
+                        case AggFunc::NONE: break;
+                    }
+                }
+            }
+        }
+
+        // Assemble result
+        QueryResultSet result;
+        result.column_names.push_back(group_col_p);
+        result.column_types.push_back(ColumnType::INT64);
+        for (size_t ci = 0; ci < ncols; ++ci) {
+            const auto& col = stmt.columns[ci];
+            if (col.agg == AggFunc::NONE) continue;
+            std::string name = col.alias.empty()
+                ? (col.arith_expr ? "expr" : (col.column.empty() ? "*" : col.column))
+                : col.alias;
+            result.column_names.push_back(name);
+            result.column_types.push_back(ColumnType::INT64);
+        }
+        for (auto& [gk_scalar, slot] : merged_key_to_slot) {
+            std::vector<int64_t> row;
+            row.push_back(gk_scalar);
+            const GroupState* states = merged_flat.data() + slot * ncols;
+            for (size_t ci = 0; ci < ncols; ++ci) {
+                const auto& col = stmt.columns[ci];
+                if (col.agg == AggFunc::NONE) continue;
+                const auto& gs = states[ci];
+                switch (col.agg) {
+                    case AggFunc::COUNT: row.push_back(gs.count); break;
+                    case AggFunc::SUM:   row.push_back(gs.sum); break;
+                    case AggFunc::AVG:   row.push_back(gs.count > 0 ? static_cast<int64_t>(gs.avg_sum / gs.count) : INT64_MIN); break;
+                    case AggFunc::MIN:   row.push_back(gs.minv == INT64_MAX ? INT64_MIN : gs.minv); break;
+                    case AggFunc::MAX:   row.push_back(gs.maxv == INT64_MIN ? INT64_MIN : gs.maxv); break;
+                    case AggFunc::VWAP:  row.push_back(gs.vwap_v > 0 ? static_cast<int64_t>(gs.vwap_pv / gs.vwap_v) : INT64_MIN); break;
+                    case AggFunc::FIRST: row.push_back(gs.first_val); break;
+                    case AggFunc::LAST:  row.push_back(gs.last_val); break;
+                    case AggFunc::XBAR:  row.push_back(gs.first_val); break;
+                    case AggFunc::NONE: break;
+                }
+            }
+            result.rows.push_back(std::move(row));
+        }
+        result.rows_scanned = rows_scanned;
+        if (stmt.having.has_value())
+            result = apply_having_filter(std::move(result), stmt.having.value());
+        apply_order_by(result, stmt);
+        if (!stmt.order_by.has_value() &&
+            stmt.limit.has_value() && result.rows.size() > (size_t)stmt.limit.value())
+            result.rows.resize(stmt.limit.value());
+        return result;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Multi-column parallel path: composite vector<int64_t> key.
+    // ─────────────────────────────────────────────────────────────────────
     using GroupMap = std::unordered_map<std::vector<int64_t>, std::vector<GroupState>, VectorHash>;
 
     struct PartialGroup {
@@ -2888,12 +3821,12 @@ QueryResultSet QueryExecutor::exec_group_agg_parallel(
                     row.push_back(gs.count > 0
                         ? static_cast<int64_t>(gs.avg_sum / gs.count) : 0); break;
                 case AggFunc::MIN:
-                    row.push_back(gs.minv == INT64_MAX ? 0 : gs.minv); break;
+                    row.push_back(gs.minv == INT64_MAX ? INT64_MIN : gs.minv); break;
                 case AggFunc::MAX:
-                    row.push_back(gs.maxv == INT64_MIN ? 0 : gs.maxv); break;
+                    row.push_back(gs.maxv == INT64_MIN ? INT64_MIN : gs.maxv); break;
                 case AggFunc::VWAP:
                     row.push_back(gs.vwap_v > 0
-                        ? static_cast<int64_t>(gs.vwap_pv / gs.vwap_v) : 0); break;
+                        ? static_cast<int64_t>(gs.vwap_pv / gs.vwap_v) : INT64_MIN); break;
                 case AggFunc::FIRST: row.push_back(gs.first_val); break;
                 case AggFunc::LAST:  row.push_back(gs.last_val);  break;
                 case AggFunc::XBAR:  row.push_back(gs.first_val); break;
@@ -2908,6 +3841,139 @@ QueryResultSet QueryExecutor::exec_group_agg_parallel(
     // HAVING 필터 (병렬 집계 결과에 적용)
     if (stmt.having.has_value())
         result = apply_having_filter(std::move(result), stmt.having.value());
+
+    apply_order_by(result, stmt);
+    if (!stmt.order_by.has_value() &&
+        stmt.limit.has_value() && result.rows.size() > (size_t)stmt.limit.value()) {
+        result.rows.resize(stmt.limit.value());
+    }
+
+    return result;
+}
+
+// ============================================================================
+// exec_simple_select_parallel — partition-parallel SELECT
+// ============================================================================
+QueryResultSet QueryExecutor::exec_simple_select_parallel(
+    const SelectStmt& stmt,
+    const std::vector<Partition*>& partitions)
+{
+    using namespace apex::execution;
+
+    size_t n_threads = pool_raw_->num_threads();
+    ParallelScanExecutor pse(*pool_raw_);
+
+    size_t total_rows = estimate_total_rows(partitions);
+    ParallelMode mode = ParallelScanExecutor::select_mode(
+        partitions.size(), total_rows, n_threads, par_opts_.row_threshold);
+
+    std::vector<std::pair<size_t,size_t>> row_ranges;
+    bool is_chunked = (mode == ParallelMode::CHUNKED && partitions.size() == 1);
+
+    auto chunks = ParallelScanExecutor::make_partition_chunks(partitions, n_threads);
+    if (is_chunked) {
+        row_ranges = ParallelScanExecutor::make_row_chunks(
+            partitions[0]->num_rows(), n_threads);
+        chunks.clear();
+        for (size_t i = 0; i < row_ranges.size(); ++i)
+            chunks.push_back({partitions[0]});
+    }
+
+    int64_t ts_lo = INT64_MIN, ts_hi = INT64_MAX;
+    bool use_ts_index = extract_time_range(stmt, ts_lo, ts_hi);
+    bool is_star = stmt.columns.size() == 1 && stmt.columns[0].is_star;
+
+    auto worker = [&, is_chunked](const std::vector<Partition*>& chunk,
+                      size_t tid, QueryResultSet& out) {
+        size_t limit = stmt.order_by.has_value() ? SIZE_MAX
+                     : stmt.limit.value_or(SIZE_MAX);
+
+        for (auto* part : chunk) {
+            size_t n = part->num_rows();
+            std::vector<uint32_t> sel;
+            if (is_chunked && tid < row_ranges.size()) {
+                auto [rb, re] = row_ranges[tid];
+                out.rows_scanned += re - rb;
+                sel = eval_where_ranged(stmt, *part, rb, re);
+            } else if (use_ts_index) {
+                if (!part->overlaps_time_range(ts_lo, ts_hi)) continue;
+                auto [rb, re] = part->timestamp_range(ts_lo, ts_hi);
+                out.rows_scanned += re - rb;
+                sel = eval_where_ranged(stmt, *part, rb, re);
+            } else {
+                std::string sc; int64_t slo, shi;
+                if (extract_sorted_col_range(stmt, *part, sc, slo, shi)) {
+                    auto [rb, re] = part->sorted_range(sc, slo, shi);
+                    out.rows_scanned += re - rb;
+                    sel = eval_where_ranged(stmt, *part, rb, re);
+                } else {
+                    out.rows_scanned += n;
+                    sel = eval_where(stmt, *part, n);
+                }
+            }
+
+            for (uint32_t idx : sel) {
+                if (out.rows.size() >= limit) break;
+                std::vector<int64_t> row;
+                if (is_star) {
+                    for (const auto& cv : part->columns()) {
+                        const int64_t* d = static_cast<const int64_t*>(cv->raw_data());
+                        row.push_back(d ? d[idx] : 0);
+                    }
+                } else {
+                    for (const auto& col : stmt.columns) {
+                        if (col.window_func != WindowFunc::NONE) continue;
+                        int64_t val;
+                        if (col.case_when) {
+                            val = eval_case_when(*col.case_when, *part, idx);
+                        } else if (col.arith_expr) {
+                            val = eval_arith(*col.arith_expr, *part, idx);
+                        } else if (col.column == "symbol") {
+                            val = static_cast<int64_t>(part->key().symbol_id);
+                        } else {
+                            const int64_t* d = get_col_data(*part, col.column);
+                            val = d ? d[idx] : 0;
+                        }
+                        row.push_back(val);
+                    }
+                }
+                out.rows.push_back(std::move(row));
+            }
+        }
+    };
+
+    auto init = [&]() -> QueryResultSet {
+        QueryResultSet r;
+        // Set up column metadata from first partition
+        if (!partitions.empty()) {
+            auto* part = partitions[0];
+            if (is_star) {
+                for (const auto& cv : part->columns()) {
+                    r.column_names.push_back(cv->name());
+                    r.column_types.push_back(cv->type());
+                }
+            } else {
+                for (const auto& sel : stmt.columns) {
+                    if (sel.window_func != WindowFunc::NONE) continue;
+                    r.column_names.push_back(
+                        sel.alias.empty() ? sel.column : sel.alias);
+                    r.column_types.push_back(ColumnType::INT64);
+                }
+            }
+        }
+        return r;
+    };
+
+    auto partials = pse.parallel_for_chunks<QueryResultSet>(chunks, init, worker);
+
+    // Merge: concat all partial results
+    QueryResultSet result = init();
+    for (auto& p : partials) {
+        result.rows.insert(result.rows.end(),
+                           std::make_move_iterator(p.rows.begin()),
+                           std::make_move_iterator(p.rows.end()));
+        result.rows_scanned += p.rows_scanned;
+    }
 
     apply_order_by(result, stmt);
     if (!stmt.order_by.has_value() &&
