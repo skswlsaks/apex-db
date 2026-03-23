@@ -502,7 +502,13 @@
 - [ ] **Tier C cold query offload** — Route historical queries to DuckDB/Parquet engine
   - Time range detection: recent → APEX in-memory, old → DuckDB on S3
   - **Business value:** Unified query interface across hot/cold data
-- [ ] **Hot symbol detection & rebalancing** — Detect skewed ingestion, rebalance
+- [x] **Hot symbol detection & rebalancing** ✅ Completed (2026-03-23)
+  - `HotSymbolDetector`: per-symbol tick counter, sliding window, configurable threshold
+  - `detect_hot()`: symbols exceeding threshold × average rate
+  - `snapshot()`: monitoring without reset
+  - `PartitionRouter::pin_symbol(sym, node)`: bypass hash ring for hot symbols
+  - `unpin_symbol()`: return to normal routing
+  - 6 tests: detector (detect, reset, snapshot), router (pin, unpin, list)
   - AAPL/SPY receive 10x ticks of typical symbols, overloads one node
   - Dedicated hot-symbol nodes or dynamic vnode weight adjustment
   - **Business value:** Prevents single-node bottleneck in production
