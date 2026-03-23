@@ -103,11 +103,32 @@ void FlushManager::flush_loop() {
         const size_t flushed = do_flush_sealed();
         if (flushed > 0) {
             stat_flush_triggers_.fetch_add(1, std::memory_order_relaxed);
-            APEX_DEBUG("FlushManager: 자동 플러시 {} 파티션", flushed);
+            APEX_DEBUG("FlushManager: auto-flush {} partitions", flushed);
+        }
+
+        // TTL-based partition eviction
+        const int64_t ttl = ttl_ns_.load(std::memory_order_relaxed);
+        if (ttl > 0) {
+            const int64_t cutoff = now_ns() - ttl;
+            const size_t evicted = pm_.evict_older_than(cutoff);
+            if (evicted > 0) {
+                APEX_INFO("FlushManager: TTL evicted {} partitions older than {}ns",
+                          evicted, ttl);
+            }
+        }
+
+        // Auto-snapshot timer check
+        if (config_.enable_auto_snapshot && !config_.snapshot_path.empty()) {
+            const int64_t interval_ns =
+                static_cast<int64_t>(config_.snapshot_interval_ms) * 1'000'000LL;
+            const int64_t last = last_snapshot_ns_.load(std::memory_order_relaxed);
+            if (now_ns() - last >= interval_ns) {
+                do_snapshot();
+            }
         }
     }
 
-    APEX_DEBUG("FlushManager 루프 종료");
+    APEX_DEBUG("FlushManager loop exit");
 }
 
 // ============================================================================
@@ -180,6 +201,32 @@ size_t FlushManager::do_flush_sealed() {
         }
     }
 
+    return count;
+}
+
+// ============================================================================
+// snapshot_now / do_snapshot: all partitions (including ACTIVE) → snapshot_path
+// ============================================================================
+size_t FlushManager::snapshot_now() {
+    APEX_INFO("FlushManager::snapshot_now() triggered");
+    return do_snapshot();
+}
+
+size_t FlushManager::do_snapshot() {
+    if (config_.snapshot_path.empty()) return 0;
+
+    auto all = pm_.get_all_partitions();
+    size_t count = 0;
+    for (Partition* part : all) {
+        if (!part || part->num_rows() == 0) continue;
+        const size_t bytes = writer_.snapshot_partition(*part, config_.snapshot_path);
+        if (bytes > 0) ++count;
+    }
+
+    last_snapshot_ns_.store(now_ns(), std::memory_order_relaxed);
+    if (count > 0) {
+        APEX_INFO("FlushManager: snapshot {} partitions → {}", count, config_.snapshot_path);
+    }
     return count;
 }
 

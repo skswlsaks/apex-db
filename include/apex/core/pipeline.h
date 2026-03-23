@@ -14,6 +14,7 @@
 #include "apex/common/types.h"
 #include "apex/ingestion/tick_plant.h"
 #include "apex/storage/partition_manager.h"
+#include "apex/storage/schema_registry.h"
 #include "apex/storage/hdb_writer.h"
 #include "apex/storage/hdb_reader.h"
 #include "apex/storage/flush_manager.h"
@@ -117,6 +118,16 @@ struct PipelineConfig {
 
     /// FlushManager 설정 (Tiered 모드)
     FlushConfig flush_config{};
+
+    // -------------------------
+    // Recovery 설정
+    // -------------------------
+
+    /// On start(), reload in-memory data from this snapshot directory.
+    /// Works for all storage modes — points to the same path used by
+    /// FlushConfig::snapshot_path (or a cold snapshot taken before shutdown).
+    bool        enable_recovery          = false;
+    std::string recovery_snapshot_path  = "";
 };
 
 // ============================================================================
@@ -176,6 +187,16 @@ public:
     /// FlushManager 접근 (Tiered 모드에서만 유효)
     [[nodiscard]] FlushManager* flush_manager() { return flush_manager_.get(); }
 
+    /// SchemaRegistry 접근 (DDL 실행 후 스키마 조회)
+    [[nodiscard]] SchemaRegistry& schema_registry() { return schema_registry_; }
+    [[nodiscard]] const SchemaRegistry& schema_registry() const { return schema_registry_; }
+
+    /// Evict all partitions whose hour_epoch is older than cutoff_ns,
+    /// then rebuild partition_index_ to remove stale raw pointers.
+    /// Used by ALTER TABLE SET TTL.
+    /// @return number of partitions removed
+    size_t evict_older_than_ns(int64_t cutoff_ns);
+
     /// 큐 강제 드레인 (테스트용: 백그라운드 스레드 없이 동기 드레인)
     size_t drain_sync(size_t max_items = SIZE_MAX);
 
@@ -199,6 +220,13 @@ private:
 
     // 파티션에 틱 저장
     void store_tick(const TickMessage& msg);
+
+public:
+    /// Ingest a tick directly into storage, bypassing the ring buffer.
+    /// Preserves msg.recv_ts (no timestamp overwrite).
+    void store_tick_direct(const TickMessage& msg) { store_tick(msg); }
+
+private:
 
     // 드레인 스레드 루프
     void drain_loop();
@@ -225,6 +253,9 @@ private:
     // symbol → partition 인덱스
     mutable std::mutex               partition_index_mu_;
     std::unordered_map<SymbolId, std::vector<Partition*>> partition_index_;
+
+    // Schema registry (all storage modes)
+    SchemaRegistry schema_registry_;
 
     // HDB 컴포넌트 (Tiered / Pure On-Disk 모드에서만 생성)
     std::unique_ptr<HDBWriter>    hdb_writer_;

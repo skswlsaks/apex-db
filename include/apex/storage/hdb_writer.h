@@ -76,6 +76,12 @@ public:
     /// @note  디스크 오류 시 경고 로그 후 0 반환 (예외 없음)
     size_t flush_partition(const Partition& partition);
 
+    /// 파티션 상태(ACTIVE/SEALED 무관)를 snapshot_dir에 스냅샷
+    /// 기존 파일 덮어쓰기 — 장중 크래시 복구용
+    /// @return 기록된 바이트 수
+    size_t snapshot_partition(const Partition& partition,
+                              const std::string& snapshot_dir);
+
     // --- 통계 ---
     [[nodiscard]] size_t total_bytes_written() const {
         return total_bytes_written_.load(std::memory_order_relaxed);

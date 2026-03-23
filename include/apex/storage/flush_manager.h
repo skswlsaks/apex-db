@@ -72,6 +72,19 @@ struct FlushConfig {
 
     /// S3 업로드 후 로컬 Parquet 파일 삭제 여부 (스토리지 절약)
     bool delete_local_after_s3 = false;
+
+    // -----------------------------------------------------------------------
+    // 스냅샷 옵션 (장중 크래시 복구)
+    // -----------------------------------------------------------------------
+
+    /// 주기적 스냅샷 활성화 — ACTIVE 파티션 포함 전체를 snapshot_path에 저장
+    bool        enable_auto_snapshot = false;
+
+    /// 스냅샷 주기 (밀리초, 기본 60초)
+    uint32_t    snapshot_interval_ms = 60'000;
+
+    /// 스냅샷 저장 경로 (빈 문자열이면 비활성화)
+    std::string snapshot_path        = "";
 };
 
 // ============================================================================
@@ -114,6 +127,20 @@ public:
     /// @return 플러시된 파티션 수
     size_t flush_now();
 
+    /// 수동 즉시 스냅샷 — 모든 파티션(ACTIVE 포함)을 snapshot_path에 저장
+    /// @return 스냅샷된 파티션 수 (스냅샷 비활성화 시 0)
+    size_t snapshot_now();
+
+    /// Set TTL for automated partition eviction (0 = disabled).
+    /// Thread-safe; takes effect on the next flush_loop() tick.
+    void set_ttl(int64_t ttl_ns) {
+        ttl_ns_.store(ttl_ns, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] int64_t ttl_ns() const {
+        return ttl_ns_.load(std::memory_order_relaxed);
+    }
+
     /// 현재 통계 스냅샷
     [[nodiscard]] FlushStats stats() const;
 
@@ -128,6 +155,9 @@ private:
 
     /// 모든 SEALED 파티션 플러시 (내부 공통 로직)
     size_t do_flush_sealed();
+
+    /// 모든 파티션(ACTIVE 포함) → snapshot_path 에 기록
+    size_t do_snapshot();
 
     /// 단일 파티션 Parquet 저장 + 선택적 S3 업로드
     void flush_partition_parquet(const Partition& partition);
@@ -152,6 +182,12 @@ private:
     std::atomic<uint64_t> stat_flush_triggers_{0};
     std::atomic<uint64_t> stat_manual_flushes_{0};
     std::atomic<int64_t>  stat_last_flush_ns_{0};
+
+    // 스냅샷 타이머
+    std::atomic<int64_t>  last_snapshot_ns_{0};
+
+    // TTL-based eviction (0 = disabled)
+    std::atomic<int64_t>  ttl_ns_{0};
 
     // 마지막 메모리 비율 (double을 atomic으로 저장하기 위해 uint64 비트캐스트)
     std::atomic<uint64_t> stat_last_memory_ratio_bits_{0};

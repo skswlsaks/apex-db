@@ -440,6 +440,100 @@ TEST_F(HDBTest, MappedColumn_MoveSemantics) {
     EXPECT_EQ(col2.num_rows, 200u);
 }
 
+// ============================================================================
+// Data Durability: AutoSnapshot + Recovery
+// ============================================================================
+
+TEST_F(HDBTest, AutoSnapshot_CreatesFiles) {
+    const fs::path snap_dir = fs::path(temp_dir_) / "snap";
+
+    // Build a pipeline, ingest ticks, then snapshot via FlushManager
+    PipelineConfig cfg;
+    cfg.storage_mode     = StorageMode::TIERED;
+    cfg.hdb_base_path    = (fs::path(temp_dir_) / "hdb").string();
+    cfg.flush_config.enable_auto_snapshot  = true;
+    cfg.flush_config.snapshot_interval_ms  = 60'000;  // won't fire on its own
+    cfg.flush_config.snapshot_path         = snap_dir.string();
+    cfg.flush_config.auto_seal_age_hours   = 999;     // keep partitions ACTIVE
+
+    ApexPipeline pipeline(cfg);
+
+    const int64_t base_ts = 1'700'000'000LL * 1'000'000'000LL;
+    for (int i = 0; i < 100; ++i) {
+        TickMessage msg{};
+        msg.symbol_id = 1;
+        msg.recv_ts   = base_ts + i * 1'000'000LL;
+        msg.price     = 100'0000LL + i;
+        msg.volume    = 1000LL + i;
+        pipeline.drain_sync(0);  // ensure store_tick path
+        pipeline.store_tick_direct(msg);
+    }
+
+    ASSERT_EQ(pipeline.total_stored_rows(), 100u);
+
+    // Trigger snapshot manually — must include ACTIVE partition
+    ASSERT_NE(pipeline.flush_manager(), nullptr);
+    const size_t snapped = pipeline.flush_manager()->snapshot_now();
+    EXPECT_GE(snapped, 1u) << "at least one partition should be snapshotted";
+
+    // Verify binary column files exist in snapshot dir
+    bool found_price_file = false;
+    for (auto& e : fs::recursive_directory_iterator(snap_dir)) {
+        if (e.path().filename() == "price.bin") {
+            found_price_file = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found_price_file) << "price.bin should exist under snapshot dir";
+}
+
+TEST_F(HDBTest, Recovery_ReloadsData) {
+    const fs::path snap_dir = fs::path(temp_dir_) / "snap2";
+
+    // --- Phase 1: ingest + snapshot ---
+    {
+        PipelineConfig cfg;
+        cfg.storage_mode     = StorageMode::TIERED;
+        cfg.hdb_base_path    = (fs::path(temp_dir_) / "hdb2").string();
+        cfg.flush_config.snapshot_path       = snap_dir.string();
+        cfg.flush_config.auto_seal_age_hours = 999;
+
+        ApexPipeline pipeline(cfg);
+
+        const int64_t base_ts = 1'700'000'000LL * 1'000'000'000LL;
+        const size_t N = 50;
+        for (size_t i = 0; i < N; ++i) {
+            TickMessage msg{};
+            msg.symbol_id = 42;
+            msg.recv_ts   = base_ts + static_cast<int64_t>(i) * 1'000'000LL;
+            msg.price     = 200'0000LL + static_cast<int64_t>(i);
+            msg.volume    = 500LL;
+            pipeline.store_tick_direct(msg);
+        }
+        ASSERT_EQ(pipeline.total_stored_rows(), N);
+
+        // Snapshot while still ACTIVE
+        ASSERT_NE(pipeline.flush_manager(), nullptr);
+        pipeline.flush_manager()->snapshot_now();
+    }
+
+    // --- Phase 2: new pipeline, recover from snapshot ---
+    {
+        PipelineConfig cfg;
+        cfg.storage_mode              = StorageMode::PURE_IN_MEMORY;
+        cfg.enable_recovery           = true;
+        cfg.recovery_snapshot_path    = snap_dir.string();
+
+        ApexPipeline pipeline(cfg);
+        pipeline.start();  // triggers recovery
+
+        EXPECT_EQ(pipeline.total_stored_rows(), 50u)
+            << "recovered pipeline should have all 50 rows";
+
+        pipeline.stop();
+    }
+}
+
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

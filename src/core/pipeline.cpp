@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 
 namespace apex::core {
 
@@ -92,6 +93,66 @@ void ApexPipeline::start() {
                                           std::memory_order_relaxed)) {
         APEX_WARN("ApexPipeline::start() — 이미 실행 중");
         return;
+    }
+
+    // Recovery: reload in-memory data from snapshot directory
+    if (config_.enable_recovery && !config_.recovery_snapshot_path.empty()) {
+        const std::string& snap = config_.recovery_snapshot_path;
+        namespace fs = std::filesystem;
+        size_t recovered_rows = 0;
+
+        std::error_code ec;
+        if (fs::exists(snap, ec)) {
+            HDBReader snap_reader(snap);
+
+            for (auto& sym_entry : fs::directory_iterator(snap, ec)) {
+                if (!sym_entry.is_directory()) continue;
+                SymbolId sym_id = 0;
+                try { sym_id = static_cast<SymbolId>(
+                    std::stoll(sym_entry.path().filename().string())); }
+                catch (...) { continue; }
+
+                for (auto& hour_entry : fs::directory_iterator(sym_entry.path(), ec)) {
+                    if (!hour_entry.is_directory()) continue;
+                    int64_t hour_epoch = 0;
+                    try { hour_epoch = std::stoll(
+                        hour_entry.path().filename().string()); }
+                    catch (...) { continue; }
+
+                    auto ts_col  = snap_reader.read_column(sym_id, hour_epoch, COL_TIMESTAMP);
+                    auto px_col  = snap_reader.read_column(sym_id, hour_epoch, COL_PRICE);
+                    auto vol_col = snap_reader.read_column(sym_id, hour_epoch, COL_VOLUME);
+                    auto mt_col  = snap_reader.read_column(sym_id, hour_epoch, COL_MSG_TYPE);
+
+                    if (!ts_col.valid() || !px_col.valid() || !vol_col.valid()) {
+                        APEX_WARN("Recovery: incomplete snapshot for symbol={} hour={}",
+                                  sym_id, hour_epoch);
+                        continue;
+                    }
+
+                    const size_t n = ts_col.num_rows;
+                    auto ts_span  = ts_col.as_span<int64_t>();
+                    auto px_span  = px_col.as_span<int64_t>();
+                    auto vol_span = vol_col.as_span<int64_t>();
+
+                    for (size_t i = 0; i < n; ++i) {
+                        TickMessage msg{};
+                        msg.symbol_id = sym_id;
+                        msg.recv_ts   = ts_span[i];
+                        msg.price     = px_span[i];
+                        msg.volume    = vol_span[i];
+                        if (mt_col.valid()) {
+                            msg.msg_type = static_cast<uint8_t>(
+                                mt_col.as_span<int32_t>()[i]);
+                        }
+                        store_tick(msg);
+                        ++recovered_rows;
+                    }
+                }
+            }
+        }
+
+        APEX_INFO("Recovery complete: {} rows reloaded from {}", recovered_rows, snap);
     }
 
     // FlushManager 시작 (Tiered 모드)
@@ -503,6 +564,23 @@ QueryResult ApexPipeline::query_count(
     stats_.total_rows_scanned.fetch_add(total, std::memory_order_relaxed);
 
     return r;
+}
+
+// ============================================================================
+// ============================================================================
+// evict_older_than_ns: TTL eviction + partition_index_ rebuild
+// ============================================================================
+size_t ApexPipeline::evict_older_than_ns(int64_t cutoff_ns) {
+    const size_t evicted = partition_mgr_.evict_older_than(cutoff_ns);
+    if (evicted > 0) {
+        // Rebuild partition_index_ to eliminate stale raw pointers.
+        std::lock_guard<std::mutex> lk(partition_index_mu_);
+        partition_index_.clear();
+        for (Partition* p : partition_mgr_.get_all_partitions()) {
+            partition_index_[p->key().symbol_id].push_back(p);
+        }
+    }
+    return evicted;
 }
 
 // ============================================================================

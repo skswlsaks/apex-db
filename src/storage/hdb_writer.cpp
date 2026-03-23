@@ -93,6 +93,36 @@ size_t HDBWriter::flush_partition(const Partition& partition) {
 }
 
 // ============================================================================
+// snapshot_partition: 파티션 상태 무관 스냅샷 (ACTIVE 포함)
+// ============================================================================
+size_t HDBWriter::snapshot_partition(const Partition& partition,
+                                      const std::string& snapshot_dir) {
+    const auto& key = partition.key();
+
+    const size_t num_rows = partition.num_rows();
+    if (num_rows == 0) return 0;
+
+    // 스냅샷 디렉토리: {snapshot_dir}/{symbol_id}/{hour_epoch}
+    const std::string dir = snapshot_dir + "/" +
+                            std::to_string(key.symbol_id) + "/" +
+                            std::to_string(key.hour_epoch);
+    if (!mkdir_p(dir)) {
+        APEX_WARN("snapshot_partition: 디렉토리 생성 실패: {}", dir);
+        return 0;
+    }
+
+    size_t total_written = 0;
+    for (const auto& col_ptr : partition.columns()) {
+        if (!col_ptr) continue;
+        total_written += write_column_file(dir, *col_ptr);
+    }
+
+    APEX_DEBUG("snapshot 완료: symbol={}, hour={}, rows={}, bytes={}",
+               key.symbol_id, key.hour_epoch, num_rows, total_written);
+    return total_written;
+}
+
+// ============================================================================
 // write_column_file: 단일 컬럼 → 바이너리 파일
 // ============================================================================
 size_t HDBWriter::write_column_file(const std::string& dir_path,

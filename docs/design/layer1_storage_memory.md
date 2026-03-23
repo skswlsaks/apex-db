@@ -97,6 +97,90 @@ Timestamps within each partition are monotonically increasing (append-only). The
 
 Related code: `Partition::timestamp_range()`, `Partition::overlaps_time_range()`, `QueryExecutor::extract_time_range()`
 
+## 7. Data Durability — Intra-day Snapshot & Recovery
+
+**Status:** ✅ Implemented (2026-03-23)
+
+### Problem
+
+APEX-DB is an in-memory database. Without explicit persistence:
+- A process crash or node restart loses all RDB (ACTIVE partition) data since the last EOD flush.
+- SEALED partitions are only written to HDB by `FlushManager` on memory pressure — not on a time-based schedule.
+
+### Design
+
+Two orthogonal mechanisms together close the data loss window to at most `snapshot_interval_ms` (default 60 s):
+
+#### 7.1 Intra-day Auto-Snapshot
+
+`FlushManager` (background thread) writes a **binary snapshot** of every partition — including ACTIVE partitions that have not yet been sealed — to a configurable `snapshot_path` directory.
+
+```
+{snapshot_path}/{symbol_id}/{hour_epoch}/{col}.bin
+```
+
+The snapshot uses the same LZ4-compressed binary format as HDB flush (`HDBWriter::snapshot_partition()`), but skips the sealed-state check. Files are overwritten on every snapshot cycle, making recovery deterministic.
+
+**Config:**
+```cpp
+FlushConfig cfg;
+cfg.enable_auto_snapshot  = true;
+cfg.snapshot_interval_ms  = 60'000;   // 60s default
+cfg.snapshot_path         = "/var/apex/snap";
+```
+
+**Manual trigger:**
+```cpp
+flush_manager->snapshot_now();  // synchronous
+```
+
+**Implementation:** `src/storage/flush_manager.cpp` — `do_snapshot()`, `snapshot_now()`
+
+Timer check is inside `flush_loop()`:
+```
+every check_interval_ms:
+  → do_flush_sealed()          // existing SEALED flush
+  → if now - last_snapshot ≥ snapshot_interval_ms → do_snapshot()
+```
+
+#### 7.2 Recovery on Restart
+
+When `PipelineConfig::enable_recovery = true`, `ApexPipeline::start()` reloads the snapshot directory **before** starting drain threads. Recovery is safe at all `StorageMode` levels (PURE_IN_MEMORY, TIERED, PURE_ON_DISK).
+
+```cpp
+PipelineConfig cfg;
+cfg.enable_recovery          = true;
+cfg.recovery_snapshot_path   = "/var/apex/snap";
+
+ApexPipeline pipeline(cfg);
+pipeline.start();  // reads snapshot → store_tick() each row → starts drain
+```
+
+Recovery path:
+1. `std::filesystem::directory_iterator` enumerates `{snap}/{symbol}/{hour}` directories.
+2. `HDBReader::read_column()` mmap-reads `timestamp`, `price`, `volume`, `msg_type`.
+3. Each row reconstructed as `TickMessage` and replayed via `store_tick()`.
+4. Drain threads start after all rows are loaded — no concurrency hazard.
+
+**Implementation:** `src/core/pipeline.cpp` — `ApexPipeline::start()` recovery block
+
+### Guarantees
+
+| Property | Value |
+|----------|-------|
+| Max data loss window | ≤ `snapshot_interval_ms` (default 60 s) |
+| Snapshot overhead | Negligible — sequential write, same thread as flush_loop |
+| Recovery time | Proportional to snapshot size (mmap → store_tick) |
+| Thread safety | Recovery runs single-threaded before drain threads start |
+| Storage format | Same binary `.bin` as HDB — no additional format |
+
+### Integration Test Coverage
+
+| Test | What is verified |
+|------|-----------------|
+| `HDBTest.AutoSnapshot_CreatesFiles` | `snapshot_now()` creates `price.bin` in snapshot dir for ACTIVE partition |
+| `HDBTest.Recovery_ReloadsData` | New pipeline with `enable_recovery=true` restores all 50 rows from snapshot |
+
 ---
 
 *Last updated: 2026-03-23*
