@@ -94,16 +94,20 @@ private:
 class ParquetExporter {
 public:
     struct ExportOptions {
-        std::string compression = "SNAPPY";  // SNAPPY, GZIP, ZSTD, BROTLI, LZ4
-        int compression_level = -1;          // -1 = default
-        size_t row_group_size = 100000;
-        bool enable_dictionary = true;
-        bool enable_statistics = true;
-        bool write_arrow_schema = true;       // embed Arrow schema in metadata
-        std::string partition_column;         // for partitioned export
+        std::string compression;
+        int compression_level;
+        size_t row_group_size;
+        bool enable_dictionary;
+        bool enable_statistics;
+        bool write_arrow_schema;
+        std::string partition_column;
+        ExportOptions()
+            : compression("SNAPPY"), compression_level(-1), row_group_size(100000),
+              enable_dictionary(true), enable_statistics(true),
+              write_arrow_schema(true) {}
     };
 
-    explicit ParquetExporter(const ExportOptions& opts = {});
+    explicit ParquetExporter(const ExportOptions& opts = ExportOptions{});
 
     // Generate DuckDB COPY TO command for Parquet export
     std::string generate_copy_command(const std::string& query,

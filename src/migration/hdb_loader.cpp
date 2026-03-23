@@ -97,7 +97,7 @@ bool HDBLoader::discover_tables() {
     }
 
     std::cout << "Discovered " << tables_.size() << " tables" << std::endl;
-    return !tables_.empty();
+    return true;
 }
 
 bool HDBLoader::is_splayed_table(const std::filesystem::path& path) {

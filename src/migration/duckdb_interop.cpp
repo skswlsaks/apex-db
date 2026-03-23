@@ -3,6 +3,7 @@
 // ============================================================================
 #include "apex/migration/duckdb_interop.h"
 #include <sstream>
+#include <fstream>
 #include <algorithm>
 #include <filesystem>
 
@@ -94,7 +95,7 @@ std::string APEXToDuckDBTypeMapper::ktype_to_parquet_logical(int8_t kdb_type) {
 // ============================================================================
 
 std::string ParquetColumn::to_schema_string() const {
-    return "  " + (required ? "required" : "optional") +
+    return std::string("  ") + (required ? "required" : "optional") +
            " " + physical_type +
            " " + name + ";";
 }
@@ -120,14 +121,14 @@ std::string ParquetSchema::to_arrow_schema() const {
 
     for (const auto& col : columns) {
         std::string arrow_type;
-        if (col.physical_type == "INT32")      arrow_type = "pa.int32()";
+        if (col.logical_type.find("TIMESTAMP") != std::string::npos)
+            arrow_type = "pa.timestamp('ns', tz='UTC')";
+        else if (col.logical_type == "DATE")    arrow_type = "pa.date32()";
+        else if (col.physical_type == "INT32")      arrow_type = "pa.int32()";
         else if (col.physical_type == "INT64")  arrow_type = "pa.int64()";
         else if (col.physical_type == "FLOAT")  arrow_type = "pa.float32()";
         else if (col.physical_type == "DOUBLE") arrow_type = "pa.float64()";
         else if (col.physical_type == "BYTE_ARRAY") arrow_type = "pa.large_string()";
-        else if (col.logical_type == "TIMESTAMP(isAdjustedToUTC=true, unit=NANOS)")
-            arrow_type = "pa.timestamp('ns', tz='UTC')";
-        else if (col.logical_type == "DATE")    arrow_type = "pa.date32()";
         else arrow_type = "pa.string()";
 
         ss << "    pa.field('" << col.name << "', " << arrow_type << "),\n";

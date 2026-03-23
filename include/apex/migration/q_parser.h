@@ -16,6 +16,9 @@ namespace apex::migration {
 
 enum class QNodeType {
     SELECT,
+    UPDATE,
+    DELETE,
+    EXEC,
     WHERE,
     BY,
     FROM,
@@ -23,10 +26,24 @@ enum class QNodeType {
     AJ,            // asof join
     WJ,            // window join
     FUNCTION_CALL,
+    FUNCTION_DEF,  // {[args] body}
     COLUMN,
     LITERAL,
     BINARY_OP,
-    SYMBOL_LIST
+    UNARY_OP,
+    ASSIGN,        // var: expr
+    COND,          // $[cond;true;false]
+    LIST,          // (a;b;c) or `a`b`c
+    SYMBOL_LIST,
+    IN_EXPR,       // x in `a`b`c
+    WITHIN_EXPR,   // x within (lo;hi)
+    LIKE_EXPR,     // x like "pattern"
+    BLOCK,         // multiple statements
+    EACH,          // func each list
+    OVER,          // func over list (/)
+    SCAN,          // func scan list (\)
+    CAST,          // "T"$expr
+    INDEX          // table[expr] or list[idx]
 };
 
 enum class QOperator {
@@ -68,24 +85,45 @@ enum class QTokenType {
     EXEC,
     UPDATE,
     DELETE,
+    IN,
+    NOT,
+    WITHIN,
+    LIKE,
+    EACH,
     IDENTIFIER,
     NUMBER,
     STRING,
     SYMBOL,        // `sym
     DATE,          // 2024.01.01
-    TIME,
+    TIME,          // 12:30:00
+    TIMESPAN,      // 0D12:30:00.000000000
     LPAREN,
     RPAREN,
     LBRACKET,
     RBRACKET,
+    LBRACE,        // {
+    RBRACE,        // }
     SEMICOLON,
     COMMA,
+    COLON,         // :
+    DCOLON,        // ::
     EQ,            // =
     LT,            // <
     GT,            // >
     LE,            // <=
     GE,            // >=
     NE,            // <>
+    TILDE,         // ~ (match)
+    BANG,          // ! (key, dict)
+    HASH,          // # (take, count)
+    AT,            // @ (apply)
+    QUESTION,      // ? (find, rand)
+    DOLLAR,        // $ (cast, cond)
+    DOT,           // .
+    PLUS,
+    MINUS,
+    STAR,          // *
+    PERCENT,       // % (divide in q)
     AND,
     OR,
     BACKTICK,      // `
@@ -148,6 +186,9 @@ private:
 
     // Parsing methods
     std::shared_ptr<QNode> parse_select();
+    std::shared_ptr<QNode> parse_update();
+    std::shared_ptr<QNode> parse_delete();
+    std::shared_ptr<QNode> parse_exec();
     std::shared_ptr<QNode> parse_from();
     std::shared_ptr<QNode> parse_where();
     std::shared_ptr<QNode> parse_by();
@@ -155,7 +196,12 @@ private:
     std::shared_ptr<QNode> parse_aj();
     std::shared_ptr<QNode> parse_wj();
     std::shared_ptr<QNode> parse_expression();
+    std::shared_ptr<QNode> parse_additive();
+    std::shared_ptr<QNode> parse_primary();
     std::shared_ptr<QNode> parse_function_call();
+    std::shared_ptr<QNode> parse_function_def();
+    std::shared_ptr<QNode> parse_cond();
+    std::shared_ptr<QNode> parse_list();
     std::shared_ptr<QNode> parse_column();
     std::shared_ptr<QNode> parse_literal();
     std::shared_ptr<QNode> parse_symbol_list();

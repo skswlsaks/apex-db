@@ -75,6 +75,7 @@ struct HDBTable {
 
     HDBTable(const std::string& n)
         : name(n), is_splayed(false), is_partitioned(false) {}
+    HDBTable() : is_splayed(false), is_partitioned(false) {}
 };
 
 // ============================================================================

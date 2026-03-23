@@ -248,6 +248,88 @@ TEST(QToSQLTest, LargeQueryPerformance) {
 }
 
 // ============================================================================
+// Extended Tests
+// ============================================================================
+
+TEST(QToSQLTest, InExpression) {
+    std::string q = "select from trades where sym in `AAPL`MSFT";
+    std::string sql = convert_q_to_sql(q);
+    EXPECT_NE(sql.find("IN"), std::string::npos);
+    EXPECT_NE(sql.find("AAPL"), std::string::npos);
+    EXPECT_NE(sql.find("MSFT"), std::string::npos);
+}
+
+TEST(QToSQLTest, WithinExpression) {
+    std::string q = "select from trades where price within (100;200)";
+    std::string sql = convert_q_to_sql(q);
+    EXPECT_NE(sql.find("BETWEEN"), std::string::npos);
+    EXPECT_NE(sql.find("100"), std::string::npos);
+    EXPECT_NE(sql.find("200"), std::string::npos);
+}
+
+TEST(QToSQLTest, LikeExpression) {
+    std::string q = "select from trades where sym like \"AA%\"";
+    std::string sql = convert_q_to_sql(q);
+    EXPECT_NE(sql.find("LIKE"), std::string::npos);
+}
+
+TEST(QToSQLTest, MultipleWhereComma) {
+    std::string q = "select from trades where sym=`AAPL, price>100";
+    std::string sql = convert_q_to_sql(q);
+    EXPECT_NE(sql.find("AND"), std::string::npos);
+    EXPECT_NE(sql.find("AAPL"), std::string::npos);
+    EXPECT_NE(sql.find("100"), std::string::npos);
+}
+
+TEST(QToSQLTest, Arithmetic) {
+    std::string q = "select price * volume from trades";
+    std::string sql = convert_q_to_sql(q);
+    EXPECT_NE(sql.find("*"), std::string::npos);
+    EXPECT_NE(sql.find("price"), std::string::npos);
+}
+
+TEST(QToSQLTest, UpdateStatement) {
+    std::string q = "update vwap: price from trades where sym=`AAPL";
+    QLexer lexer(q);
+    auto tokens = lexer.tokenize();
+    QParser parser(tokens);
+    auto ast = parser.parse();
+    QToSQLTransformer transformer;
+    std::string sql = transformer.transform(ast);
+    EXPECT_NE(sql.find("UPDATE"), std::string::npos);
+    EXPECT_NE(sql.find("SET"), std::string::npos);
+    EXPECT_NE(sql.find("vwap"), std::string::npos);
+}
+
+TEST(QToSQLTest, DeleteStatement) {
+    std::string q = "delete from trades where price>1000";
+    QLexer lexer(q);
+    auto tokens = lexer.tokenize();
+    QParser parser(tokens);
+    auto ast = parser.parse();
+    QToSQLTransformer transformer;
+    std::string sql = transformer.transform(ast);
+    EXPECT_NE(sql.find("DELETE"), std::string::npos);
+    EXPECT_NE(sql.find("FROM trades"), std::string::npos);
+    EXPECT_NE(sql.find("1000"), std::string::npos);
+}
+
+TEST(QToSQLTest, ConditionalExpression) {
+    std::string q = "select $[price>100;1;0] from trades";
+    std::string sql = convert_q_to_sql(q);
+    EXPECT_NE(sql.find("CASE WHEN"), std::string::npos);
+    EXPECT_NE(sql.find("THEN"), std::string::npos);
+    EXPECT_NE(sql.find("ELSE"), std::string::npos);
+}
+
+TEST(QToSQLTest, PrevFunction) {
+    std::string q = "select prev price from trades";
+    std::string sql = convert_q_to_sql(q);
+    EXPECT_NE(sql.find("LAG"), std::string::npos);
+    EXPECT_NE(sql.find("OVER"), std::string::npos);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 

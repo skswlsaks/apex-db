@@ -2,6 +2,7 @@
 // APEX-DB Migration Tool: apex-migrate
 // ============================================================================
 #include "apex/migration/q_parser.h"
+#include "apex/migration/q_to_python.h"
 #include "apex/migration/hdb_loader.h"
 #include "apex/migration/clickhouse_migrator.h"
 #include "apex/migration/duckdb_interop.h"
@@ -38,6 +39,7 @@ struct MigrateOptions {
     std::string partition_date;
     bool verbose = false;
     bool dry_run = false;
+    std::string target = "sql";  // sql or python
 
     // ClickHouse options
     std::string ch_host = "localhost";
@@ -72,7 +74,8 @@ Modes:
 
 Query Mode:
   -i, --input <file>       Input .q file
-  -o, --output <file>      Output .sql file (default: stdout)
+  -o, --output <file>      Output file (default: stdout)
+  --target <sql|python>    Output target (default: sql)
 
 HDB Mode:
   -d, --hdb-dir <path>     kdb+ HDB root directory
@@ -153,6 +156,7 @@ MigrateOptions parse_args(int argc, char* argv[]) {
         else if (arg == "--threads")                    { if (i+1 < argc) opts.duckdb_threads = std::stoi(argv[++i]); }
         else if (arg == "--retention")                  { if (i+1 < argc) { opts.add_retention = true; opts.retention_days = std::stoi(argv[++i]); } }
         else if (arg == "--no-compression")             { opts.enable_compression = false; }
+        else if (arg == "--target")                     { if (i+1 < argc) opts.target = argv[++i]; }
         else if (arg == "-v" || arg == "--verbose")     { opts.verbose = true; }
         else if (arg == "--dry-run")                    { opts.dry_run = true; }
     }
@@ -180,21 +184,26 @@ bool migrate_query(const MigrateOptions& opts) {
     }
 
     try {
-        QLexer lexer(q_query);
-        auto tokens = lexer.tokenize();
+        std::string result;
 
-        QParser parser(tokens);
-        auto ast = parser.parse();
-
-        QToSQLTransformer transformer;
-        std::string sql = transformer.transform(ast);
+        if (opts.target == "python") {
+            QToPythonTransformer transformer;
+            result = transformer.transform_script(q_query);
+        } else {
+            QLexer lexer(q_query);
+            auto tokens = lexer.tokenize();
+            QParser parser(tokens);
+            auto ast = parser.parse();
+            QToSQLTransformer transformer;
+            result = transformer.transform(ast);
+        }
 
         if (opts.output.empty()) {
-            std::cout << sql << std::endl;
+            std::cout << result << std::endl;
         } else {
             std::ofstream out(opts.output);
-            out << sql << std::endl;
-            if (opts.verbose) std::cout << "SQL written to: " << opts.output << "\n";
+            out << result << std::endl;
+            if (opts.verbose) std::cout << opts.target << " written to: " << opts.output << "\n";
         }
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

@@ -87,6 +87,11 @@ QToken QLexer::read_identifier() {
     if (id == "delete") return QToken(QTokenType::DELETE, id, start_line, start_col);
     if (id == "and") return QToken(QTokenType::AND, id, start_line, start_col);
     if (id == "or") return QToken(QTokenType::OR, id, start_line, start_col);
+    if (id == "in") return QToken(QTokenType::IN, id, start_line, start_col);
+    if (id == "not") return QToken(QTokenType::NOT, id, start_line, start_col);
+    if (id == "within") return QToken(QTokenType::WITHIN, id, start_line, start_col);
+    if (id == "like") return QToken(QTokenType::LIKE, id, start_line, start_col);
+    if (id == "each") return QToken(QTokenType::EACH, id, start_line, start_col);
 
     return QToken(QTokenType::IDENTIFIER, id, start_line, start_col);
 }
@@ -205,6 +210,14 @@ std::vector<QToken> QLexer::tokenize() {
                 tokens.push_back(QToken(QTokenType::RBRACKET, "]", start_line, start_col));
                 advance();
                 break;
+            case '{':
+                tokens.push_back(QToken(QTokenType::LBRACE, "{", start_line, start_col));
+                advance();
+                break;
+            case '}':
+                tokens.push_back(QToken(QTokenType::RBRACE, "}", start_line, start_col));
+                advance();
+                break;
             case ';':
                 tokens.push_back(QToken(QTokenType::SEMICOLON, ";", start_line, start_col));
                 advance();
@@ -213,9 +226,92 @@ std::vector<QToken> QLexer::tokenize() {
                 tokens.push_back(QToken(QTokenType::COMMA, ",", start_line, start_col));
                 advance();
                 break;
+            case ':':
+                if (peek() == ':') {
+                    tokens.push_back(QToken(QTokenType::DCOLON, "::", start_line, start_col));
+                    advance(); advance();
+                } else {
+                    tokens.push_back(QToken(QTokenType::COLON, ":", start_line, start_col));
+                    advance();
+                }
+                break;
             case '=':
                 tokens.push_back(QToken(QTokenType::EQ, "=", start_line, start_col));
                 advance();
+                break;
+            case '+':
+                tokens.push_back(QToken(QTokenType::PLUS, "+", start_line, start_col));
+                advance();
+                break;
+            case '-':
+                // Negative number: - followed by digit with no preceding identifier/number
+                if (std::isdigit(peek()) &&
+                    (tokens.empty() ||
+                     tokens.back().type == QTokenType::LPAREN ||
+                     tokens.back().type == QTokenType::LBRACKET ||
+                     tokens.back().type == QTokenType::SEMICOLON ||
+                     tokens.back().type == QTokenType::COMMA ||
+                     tokens.back().type == QTokenType::COLON ||
+                     tokens.back().type == QTokenType::EQ ||
+                     tokens.back().type == QTokenType::LT ||
+                     tokens.back().type == QTokenType::GT ||
+                     tokens.back().type == QTokenType::PLUS ||
+                     tokens.back().type == QTokenType::MINUS ||
+                     tokens.back().type == QTokenType::STAR ||
+                     tokens.back().type == QTokenType::PERCENT)) {
+                    advance(); // skip '-'
+                    auto num_tok = read_number();
+                    num_tok.value = "-" + num_tok.value;
+                    tokens.push_back(num_tok);
+                } else {
+                    tokens.push_back(QToken(QTokenType::MINUS, "-", start_line, start_col));
+                    advance();
+                }
+                break;
+            case '*':
+                tokens.push_back(QToken(QTokenType::STAR, "*", start_line, start_col));
+                advance();
+                break;
+            case '%':
+                tokens.push_back(QToken(QTokenType::PERCENT, "%", start_line, start_col));
+                advance();
+                break;
+            case '~':
+                tokens.push_back(QToken(QTokenType::TILDE, "~", start_line, start_col));
+                advance();
+                break;
+            case '!':
+                tokens.push_back(QToken(QTokenType::BANG, "!", start_line, start_col));
+                advance();
+                break;
+            case '#':
+                tokens.push_back(QToken(QTokenType::HASH, "#", start_line, start_col));
+                advance();
+                break;
+            case '@':
+                tokens.push_back(QToken(QTokenType::AT, "@", start_line, start_col));
+                advance();
+                break;
+            case '?':
+                tokens.push_back(QToken(QTokenType::QUESTION, "?", start_line, start_col));
+                advance();
+                break;
+            case '$':
+                tokens.push_back(QToken(QTokenType::DOLLAR, "$", start_line, start_col));
+                advance();
+                break;
+            case '.':
+                // Could be .z.d, .z.t etc — read as identifier
+                {
+                    std::string dotid;
+                    dotid += current();
+                    advance();
+                    while (std::isalnum(current()) || current() == '.' || current() == '_') {
+                        dotid += current();
+                        advance();
+                    }
+                    tokens.push_back(QToken(QTokenType::IDENTIFIER, dotid, start_line, start_col));
+                }
                 break;
             case '<':
                 if (peek() == '=') {
@@ -242,7 +338,9 @@ std::vector<QToken> QLexer::tokenize() {
                 }
                 break;
             default:
-                throw std::runtime_error("Unexpected character: " + std::string(1, current()));
+                // Skip unknown characters instead of throwing
+                advance();
+                break;
         }
     }
 

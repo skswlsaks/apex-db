@@ -235,7 +235,4 @@ TEST(TSDBMigratorTest, GenerateSQLWithoutCompression) {
 // Main
 // ============================================================================
 
-int main(int argc, char** argv) {
-    testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
+// main provided by test_q_to_sql.cpp

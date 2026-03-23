@@ -149,15 +149,18 @@ private:
 class ClickHouseExporter {
 public:
     struct ExportOptions {
-        std::string format = "CSV";    // CSV, TSV, JSONEachRow, Native
-        bool include_header = true;
-        char delimiter = ',';
-        std::string null_value = "\\N";
-        bool escape_strings = true;
-        size_t batch_size = 100000;
+        std::string format;
+        bool include_header;
+        char delimiter;
+        std::string null_value;
+        bool escape_strings;
+        size_t batch_size;
+        ExportOptions()
+            : format("CSV"), include_header(true), delimiter(','),
+              null_value("\\N"), escape_strings(true), batch_size(100000) {}
     };
 
-    explicit ClickHouseExporter(const ExportOptions& opts = {});
+    explicit ClickHouseExporter(const ExportOptions& opts = ExportOptions{});
 
     // Export to file
     bool export_to_file(const std::string& table_name,
@@ -191,6 +194,11 @@ private:
 class ClickHouseMigrator {
 public:
     struct MigrationConfig {
+        struct ExportOptions {
+            std::string format = "CSV";
+            size_t batch_size = 100000;
+        };
+
         std::string source_hdb_path;
         std::string clickhouse_host = "localhost";
         int clickhouse_port = 8123;
@@ -202,12 +210,9 @@ public:
         bool validate = true;
         std::vector<std::string> tables;  // empty = all tables
         ExportOptions export_opts;
-
-        struct ExportOptions {
-            std::string format = "CSV";
-            size_t batch_size = 100000;
-        };
     };
+
+    using Config = MigrationConfig;
 
     explicit ClickHouseMigrator(const MigrationConfig& config);
 

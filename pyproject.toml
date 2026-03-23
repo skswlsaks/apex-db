@@ -1,14 +1,30 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
-name = "apex-py"
+name = "apex-db"
 version = "0.1.0"
-description = "Python client and DataFrame integration for APEX-DB"
+description = "Python client and DataFrame integration for APEX-DB — ultra-low latency columnar time-series database"
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
 requires-python = ">=3.9"
+authors = [{ name = "APEX-DB Contributors" }]
+keywords = ["database", "timeseries", "columnar", "HFT", "finance", "analytics"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Office/Business :: Financial",
+    "Topic :: Scientific/Engineering",
+]
 
 # Core runtime — pure stdlib, zero mandatory dependencies
 dependencies = []
