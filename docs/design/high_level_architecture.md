@@ -67,6 +67,8 @@ open-source licensing.
 │  Consistent Hash PartitionRouter (2ns)                   │
 │  SharedMemBackend (same-host, zero-copy IPC)             │
 │  HealthMonitor + ClusterManager                          │
+│  RF=2 Replication · Auto Failover · Coordinator HA       │
+│  Split-Brain Defense (FencingToken · K8s Lease)           │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -165,5 +167,6 @@ apex-migrate timescaledb # Generate TimescaleDB hypertable + continuous aggregat
 | S3 HDB Flush | ✅ | Async upload, MinIO compatible, cloud data lake |
 | Production Ops | ✅ | Monitoring, backup, k8s |
 | Python Ecosystem | ✅ | apex_py: from_pandas/polars/arrow, ArrowSession, StreamingSession (208 tests) |
-| Distributed Query | 🚧 | DistributedQueryScheduler + UCX |
+| Distributed Query | 🚧 | VWAP decomposition, ORDER BY/LIMIT done; HAVING/DISTINCT/window pending |
+| Cluster Integrity | ✅ | Unified router, fencing token, split-brain defense |
 | Snowflake/Delta Lake | 📋 | Backlog |

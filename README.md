@@ -9,7 +9,7 @@
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-blue)
 ![LLVM 19](https://img.shields.io/badge/LLVM-19-orange)
 ![Highway SIMD](https://img.shields.io/badge/SIMD-Highway-green)
-![Tests](https://img.shields.io/badge/tests-565%2B%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-607%2B%20passing-brightgreen)
 ![kdb+ replacement](https://img.shields.io/badge/kdb%2B%20replacement-95%25-success)
 
 </div>
@@ -106,6 +106,7 @@ APEX-DB is an ultra-low latency in-memory database designed for HFT, combining
 │  Transport (UCX→CXL) · Consistent Hash · Health       │
 │  Replication (RF=2) · Auto Failover · Coordinator HA  │
 │  ComputeNode · SnapshotCoordinator · WAL Replicator   │
+│  Split-Brain Defense (FencingToken · K8s Lease)        │
 └────────────────────────────────────────────────────────┘
 ```
 
@@ -423,6 +424,8 @@ curl -X DELETE https://apex:8443/admin/queries/q_a1b2c3 \
 - [x] **SQL Phase 3** — Date/time functions (DATE_TRUNC/NOW/EPOCH_S/EPOCH_MS), LIKE/NOT LIKE, UNION ALL/DISTINCT/INTERSECT/EXCEPT
 - [x] **Time range index** — O(log n) binary search within partitions, O(1) partition skip
 - [x] **Enterprise Security** — TLS/HTTPS, API Key + JWT/OIDC, RBAC, Rate Limiting, Admin REST API, Query Timeout/Kill, Secrets Management (Vault/File/Env), Audit Log (SOC2/EMIR/MiFID II) — 69 tests
+- [x] **Cluster Integrity** — Unified PartitionRouter, FencingToken in RPC (24-byte header), split-brain defense, CoordinatorHA auto re-registration — 9 tests
+- [x] **Data Durability** — Intra-day auto-snapshot (`FlushConfig::enable_auto_snapshot`, 60s default) writes all partitions including ACTIVE to binary HDB; `PipelineConfig::enable_recovery` replays snapshot on restart — max data loss window ≤ 60 s
 
 ### In Progress
 - [ ] SQL subqueries / CTE (WITH clause)
