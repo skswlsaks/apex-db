@@ -95,6 +95,11 @@ private:
     // 비-로컬 스케줄러 주입 시 nullptr → 직렬 폴백.
     apex::execution::WorkerPool* pool_raw_ = nullptr;
 
+    // DDL 실행 함수들
+    QueryResultSet exec_create_table(const CreateTableStmt& stmt);
+    QueryResultSet exec_drop_table(const DropTableStmt& stmt);
+    QueryResultSet exec_alter_table(const AlterTableStmt& stmt);
+
     // SELECT 실행 내부 함수들
     QueryResultSet exec_select(const SelectStmt& stmt);
 

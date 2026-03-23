@@ -183,6 +183,11 @@ public:
     /// Uses partition key comparison only — O(partitions), no data access.
     std::vector<Partition*> get_partitions_for_time_range(int64_t lo, int64_t hi);
 
+    /// Remove partitions whose hour_epoch is strictly before cutoff_ns.
+    /// Used for TTL-based retention eviction.
+    /// @return number of partitions removed
+    size_t evict_older_than(int64_t cutoff_ns);
+
     /// 전체 파티션 수
     [[nodiscard]] size_t partition_count() const { return partitions_.size(); }
 

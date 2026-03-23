@@ -2431,3 +2431,124 @@ TEST_F(SqlExecutorTest, Aj0_ReturnsLeftData) {
         EXPECT_GE(result.rows[0][0], 15000);
     }
 }
+
+// ============================================================================
+// DDL Tests: CREATE TABLE, DROP TABLE, ALTER TABLE, TTL eviction
+// ============================================================================
+
+TEST_F(SqlExecutorTest, CreateTable_Basic) {
+    auto r = executor->execute(
+        "CREATE TABLE prices (time TIMESTAMP, sym SYMBOL, price INT64, size INT64)");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_NE(r.string_rows[0].find("prices"), std::string::npos);
+    // Schema must be visible
+    EXPECT_TRUE(pipeline->schema_registry().exists("prices"));
+    auto schema = pipeline->schema_registry().get("prices");
+    ASSERT_TRUE(schema.has_value());
+    EXPECT_EQ(schema->columns.size(), 4u);
+    EXPECT_EQ(schema->columns[0].name, "time");
+    EXPECT_EQ(schema->columns[2].name, "price");
+}
+
+TEST_F(SqlExecutorTest, CreateTable_IfNotExists) {
+    executor->execute("CREATE TABLE quotes (bid INT64, ask INT64)");
+    // Second CREATE with IF NOT EXISTS should NOT error
+    auto r = executor->execute("CREATE TABLE IF NOT EXISTS quotes (bid INT64)");
+    EXPECT_TRUE(r.ok()) << r.error;
+    // Without IF NOT EXISTS should error
+    auto r2 = executor->execute("CREATE TABLE quotes (bid INT64)");
+    EXPECT_FALSE(r2.ok());
+}
+
+TEST_F(SqlExecutorTest, DropTable_Basic) {
+    executor->execute("CREATE TABLE temp_tbl (x INT64)");
+    EXPECT_TRUE(pipeline->schema_registry().exists("temp_tbl"));
+
+    auto r = executor->execute("DROP TABLE temp_tbl");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_FALSE(pipeline->schema_registry().exists("temp_tbl"));
+}
+
+TEST_F(SqlExecutorTest, DropTable_IfExists) {
+    // Drop non-existent with IF EXISTS — should not error
+    auto r = executor->execute("DROP TABLE IF EXISTS no_such_table");
+    EXPECT_TRUE(r.ok()) << r.error;
+    // Without IF EXISTS — should error
+    auto r2 = executor->execute("DROP TABLE no_such_table");
+    EXPECT_FALSE(r2.ok());
+}
+
+TEST_F(SqlExecutorTest, AlterTable_AddColumn) {
+    executor->execute("CREATE TABLE orders (id INT64, price INT64)");
+    auto r = executor->execute("ALTER TABLE orders ADD COLUMN volume INT64");
+    ASSERT_TRUE(r.ok()) << r.error;
+    auto schema = pipeline->schema_registry().get("orders");
+    ASSERT_TRUE(schema.has_value());
+    EXPECT_EQ(schema->columns.size(), 3u);
+    EXPECT_EQ(schema->columns[2].name, "volume");
+}
+
+TEST_F(SqlExecutorTest, AlterTable_DropColumn) {
+    executor->execute("CREATE TABLE book (bid INT64, ask INT64, mid INT64)");
+    auto r = executor->execute("ALTER TABLE book DROP COLUMN mid");
+    ASSERT_TRUE(r.ok()) << r.error;
+    auto schema = pipeline->schema_registry().get("book");
+    ASSERT_TRUE(schema.has_value());
+    EXPECT_EQ(schema->columns.size(), 2u);
+    // Dropping non-existent column should error
+    auto r2 = executor->execute("ALTER TABLE book DROP COLUMN mid");
+    EXPECT_FALSE(r2.ok());
+}
+
+TEST_F(SqlExecutorTest, AlterTable_SetTTL_Days) {
+    executor->execute("CREATE TABLE live_ticks (ts TIMESTAMP, price INT64)");
+    auto r = executor->execute("ALTER TABLE live_ticks SET TTL 30 DAYS");
+    ASSERT_TRUE(r.ok()) << r.error;
+    EXPECT_NE(r.string_rows[0].find("30"), std::string::npos);
+    auto schema = pipeline->schema_registry().get("live_ticks");
+    ASSERT_TRUE(schema.has_value());
+    // TTL should be 30 days in nanoseconds
+    const int64_t expected = 30LL * 86400LL * 1'000'000'000LL;
+    EXPECT_EQ(schema->ttl_ns, expected);
+}
+
+TEST_F(SqlExecutorTest, AlterTable_SetTTL_Evicts_OldPartitions) {
+    // Create a fresh pipeline with known old partitions
+    PipelineConfig cfg;
+    ApexPipeline local_pipeline(cfg);
+    QueryExecutor local_exec(local_pipeline);
+
+    // Insert ticks at epoch=0 (ancient) — should be evicted by TTL
+    const int64_t ancient_ts = 1'000'000'000LL; // 1970-01-01 + 1s
+    for (int i = 0; i < 5; ++i) {
+        TickMessage msg{};
+        msg.symbol_id = 99;
+        msg.recv_ts   = ancient_ts + i * 1'000'000LL;
+        msg.price     = 100LL;
+        msg.volume    = 10LL;
+        local_pipeline.store_tick_direct(msg);
+    }
+    ASSERT_EQ(local_pipeline.total_stored_rows(), 5u);
+
+    // Also insert current ticks — should survive
+    const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    for (int i = 0; i < 3; ++i) {
+        TickMessage msg{};
+        msg.symbol_id = 99;
+        msg.recv_ts   = now_ns + i * 1'000'000LL;
+        msg.price     = 200LL;
+        msg.volume    = 20LL;
+        local_pipeline.store_tick_direct(msg);
+    }
+    ASSERT_EQ(local_pipeline.total_stored_rows(), 8u);
+
+    local_exec.execute("CREATE TABLE live_data (ts TIMESTAMP, price INT64)");
+    // TTL = 1 day → ancient partition (epoch 0) should be evicted immediately
+    auto r = local_exec.execute("ALTER TABLE live_data SET TTL 1 DAYS");
+    ASSERT_TRUE(r.ok()) << r.error;
+
+    // Only current-day partitions should remain
+    EXPECT_LT(local_pipeline.total_stored_rows(), 8u)
+        << "Ancient partitions should have been evicted";
+}

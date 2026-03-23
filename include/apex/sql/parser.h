@@ -18,8 +18,12 @@ namespace apex::sql {
 // ============================================================================
 class Parser {
 public:
-    /// SQL 문자열을 파싱하여 SelectStmt 반환
-    /// 에러 시 std::runtime_error 던짐
+    /// Parse any SQL statement (SELECT or DDL) and return a ParsedStatement.
+    /// Throws std::runtime_error on syntax error.
+    ParsedStatement parse_statement(const std::string& sql);
+
+    /// Convenience wrapper: parse a SELECT-only SQL.
+    /// Throws if the statement is not a SELECT.
     SelectStmt parse(const std::string& sql);
 
 private:
@@ -57,6 +61,13 @@ private:
 
     // ====== CTE ======
     std::vector<CTEDef> parse_cte_list();     // WITH name AS (...) [, ...]
+
+    // ====== DDL ======
+    ParsedStatement    dispatch_ddl();        // dispatch after seeing CREATE/DROP/ALTER
+    CreateTableStmt    parse_create_table();
+    DropTableStmt      parse_drop_table();
+    AlterTableStmt     parse_alter_table();
+    DdlColumnDef       parse_ddl_column_def();
 
     // ====== 헬퍼 ======
     CompareOp       parse_compare_op();

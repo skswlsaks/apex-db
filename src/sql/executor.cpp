@@ -343,12 +343,142 @@ static QueryResultSet build_explain_plan(const SelectStmt& stmt,
     return result;
 }
 
+// ============================================================================
+// DDL helpers: map type string → ColumnType
+// ============================================================================
+static storage::ColumnType ddl_type_from_str(const std::string& t) {
+    if (t == "INT64"  || t == "BIGINT" || t == "LONG")  return storage::ColumnType::INT64;
+    if (t == "INT32"  || t == "INT"    || t == "INTEGER") return storage::ColumnType::INT32;
+    if (t == "FLOAT64"|| t == "DOUBLE")                  return storage::ColumnType::FLOAT64;
+    if (t == "FLOAT32"|| t == "FLOAT"  || t == "REAL")   return storage::ColumnType::FLOAT32;
+    if (t == "TIMESTAMP" || t == "TIMESTAMP_NS")         return storage::ColumnType::TIMESTAMP_NS;
+    if (t == "SYMBOL")                                   return storage::ColumnType::SYMBOL;
+    if (t == "BOOL"   || t == "BOOLEAN")                 return storage::ColumnType::BOOL;
+    throw std::runtime_error("Unknown DDL column type: " + t);
+}
+
+static QueryResultSet ddl_ok(const std::string& msg) {
+    QueryResultSet r;
+    r.column_names = {"result"};
+    r.string_rows  = {msg};
+    return r;
+}
+
+// ============================================================================
+// exec_create_table
+// ============================================================================
+QueryResultSet QueryExecutor::exec_create_table(const CreateTableStmt& stmt) {
+    std::vector<storage::ColumnDef> cols;
+    cols.reserve(stmt.columns.size());
+    for (auto& c : stmt.columns)
+        cols.push_back({c.column, ddl_type_from_str(c.type_str)});
+
+    bool ok = pipeline_.schema_registry().create(stmt.table_name, std::move(cols));
+    if (!ok) {
+        if (stmt.if_not_exists)
+            return ddl_ok("Table '" + stmt.table_name + "' already exists (IF NOT EXISTS)");
+        QueryResultSet err;
+        err.error = "Table '" + stmt.table_name + "' already exists";
+        return err;
+    }
+    return ddl_ok("Table '" + stmt.table_name + "' created");
+}
+
+// ============================================================================
+// exec_drop_table
+// ============================================================================
+QueryResultSet QueryExecutor::exec_drop_table(const DropTableStmt& stmt) {
+    bool ok = pipeline_.schema_registry().drop(stmt.table_name);
+    if (!ok) {
+        if (stmt.if_exists)
+            return ddl_ok("Table '" + stmt.table_name + "' does not exist (IF EXISTS)");
+        QueryResultSet err;
+        err.error = "Table '" + stmt.table_name + "' does not exist";
+        return err;
+    }
+    return ddl_ok("Table '" + stmt.table_name + "' dropped");
+}
+
+// ============================================================================
+// exec_alter_table
+// ============================================================================
+QueryResultSet QueryExecutor::exec_alter_table(const AlterTableStmt& stmt) {
+    auto& reg = pipeline_.schema_registry();
+
+    if (!reg.exists(stmt.table_name)) {
+        QueryResultSet err;
+        err.error = "Table '" + stmt.table_name + "' does not exist";
+        return err;
+    }
+
+    if (stmt.action == AlterTableStmt::Action::ADD_COLUMN) {
+        storage::ColumnDef col{stmt.col_def.column,
+                               ddl_type_from_str(stmt.col_def.type_str)};
+        reg.add_column(stmt.table_name, std::move(col));
+        return ddl_ok("Column '" + stmt.col_def.column + "' added to '" + stmt.table_name + "'");
+    }
+
+    if (stmt.action == AlterTableStmt::Action::DROP_COLUMN) {
+        bool ok = reg.drop_column(stmt.table_name, stmt.col_name);
+        if (!ok) {
+            QueryResultSet err;
+            err.error = "Column '" + stmt.col_name + "' not found in '" + stmt.table_name + "'";
+            return err;
+        }
+        return ddl_ok("Column '" + stmt.col_name + "' dropped from '" + stmt.table_name + "'");
+    }
+
+    // SET TTL
+    const int64_t multiplier = (stmt.ttl_unit == "HOURS")
+        ? 3'600'000'000'000LL    // ns per hour
+        : 86'400'000'000'000LL;  // ns per day (default DAYS)
+    const int64_t ttl_ns = stmt.ttl_value * multiplier;
+    reg.set_ttl(stmt.table_name, ttl_ns);
+
+    // Apply immediately: evict partitions already beyond TTL
+    if (ttl_ns > 0) {
+        const int64_t cutoff = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count()) - ttl_ns;
+        pipeline_.evict_older_than_ns(cutoff);
+
+        // Also update FlushManager so future ticks are auto-evicted
+        if (pipeline_.flush_manager()) {
+            // Use the minimum TTL across all tables
+            const int64_t min_ttl = reg.min_ttl_ns();
+            pipeline_.flush_manager()->set_ttl(min_ttl > 0 ? min_ttl : ttl_ns);
+        }
+    }
+
+    return ddl_ok("TTL set to " + std::to_string(stmt.ttl_value) + " " + stmt.ttl_unit
+                  + " for table '" + stmt.table_name + "'");
+}
+
 QueryResultSet QueryExecutor::execute(const std::string& sql) {
     tl_cte_map.clear();
     double t0 = now_us();
     try {
         Parser parser;
-        SelectStmt stmt = parser.parse(sql);
+        ParsedStatement ps = parser.parse_statement(sql);
+
+        if (ps.kind == ParsedStatement::Kind::CREATE_TABLE) {
+            auto r = exec_create_table(*ps.create_table);
+            r.execution_time_us = now_us() - t0;
+            return r;
+        }
+        if (ps.kind == ParsedStatement::Kind::DROP_TABLE) {
+            auto r = exec_drop_table(*ps.drop_table);
+            r.execution_time_us = now_us() - t0;
+            return r;
+        }
+        if (ps.kind == ParsedStatement::Kind::ALTER_TABLE) {
+            auto r = exec_alter_table(*ps.alter_table);
+            r.execution_time_us = now_us() - t0;
+            return r;
+        }
+
+        // SELECT path
+        const SelectStmt& stmt = *ps.select;
 
         // EXPLAIN: return query plan without executing
         if (stmt.explain) {
@@ -358,7 +488,6 @@ QueryResultSet QueryExecutor::execute(const std::string& sql) {
         }
 
         // Execute each CTE definition and store result in the thread-local map.
-        // Later CTEs may reference earlier ones (they are visible in tl_cte_map).
         for (auto& cte : stmt.cte_defs) {
             auto res = exec_select(*cte.stmt);
             if (!res.ok()) { tl_cte_map.clear(); return res; }
@@ -1197,11 +1326,15 @@ QueryResultSet QueryExecutor::exec_select_virtual(
             double  sum   = 0.0;
             int64_t mn    = INT64_MAX, mx = INT64_MIN;
             int64_t first = INT64_MIN, last = INT64_MIN;
+            std::set<int64_t> distinct_set;
 
             for (uint32_t ri : passing) {
                 int64_t v = sel_val_vt(sel, src, col_idx, ri);
                 switch (sel.agg) {
-                    case AggFunc::COUNT: cnt++; break;
+                    case AggFunc::COUNT:
+                        if (sel.agg_distinct) distinct_set.insert(v);
+                        else cnt++;
+                        break;
                     case AggFunc::SUM:   sum += v; break;
                     case AggFunc::AVG:   sum += v; cnt++; break;
                     case AggFunc::MIN:   if (v < mn) mn = v; break;
@@ -1213,7 +1346,8 @@ QueryResultSet QueryExecutor::exec_select_virtual(
             }
             int64_t agg_val = 0;
             switch (sel.agg) {
-                case AggFunc::COUNT: agg_val = cnt; break;
+                case AggFunc::COUNT: agg_val = sel.agg_distinct
+                    ? static_cast<int64_t>(distinct_set.size()) : cnt; break;
                 case AggFunc::SUM:   agg_val = static_cast<int64_t>(sum); break;
                 case AggFunc::AVG:   agg_val = cnt ? static_cast<int64_t>(sum / cnt) : INT64_MIN; break;
                 case AggFunc::MIN:   agg_val = (mn != INT64_MAX) ? mn : INT64_MIN; break;
@@ -1668,6 +1802,7 @@ QueryResultSet QueryExecutor::exec_agg(
     std::vector<int64_t>  first_val(stmt.columns.size(), 0);
     std::vector<int64_t>  last_val(stmt.columns.size(), 0);
     std::vector<bool>     has_first(stmt.columns.size(), false);
+    std::vector<std::set<int64_t>> distinct_sets(stmt.columns.size());
 
     // 타임스탬프 이진탐색 최적화
     int64_t ts_lo = INT64_MIN, ts_hi = INT64_MAX;
@@ -1700,7 +1835,11 @@ QueryResultSet QueryExecutor::exec_agg(
 
             switch (col.agg) {
                 case AggFunc::COUNT:
-                    cnt[ci] += static_cast<int64_t>(sel_indices.size());
+                    if (col.agg_distinct) {
+                        for (auto idx : sel_indices) distinct_sets[ci].insert(agg_val(idx));
+                    } else {
+                        cnt[ci] += static_cast<int64_t>(sel_indices.size());
+                    }
                     break;
                 case AggFunc::SUM:
                     for (auto idx : sel_indices) i_accum[ci] += agg_val(idx);
@@ -1770,7 +1909,8 @@ QueryResultSet QueryExecutor::exec_agg(
         result.column_types.push_back(ColumnType::INT64);
 
         switch (col.agg) {
-            case AggFunc::COUNT: row[ci] = cnt[ci]; break;
+            case AggFunc::COUNT: row[ci] = col.agg_distinct
+                ? static_cast<int64_t>(distinct_sets[ci].size()) : cnt[ci]; break;
             case AggFunc::SUM:   row[ci] = i_accum[ci]; break;
             case AggFunc::AVG:
                 row[ci] = cnt[ci] > 0

@@ -60,29 +60,44 @@ void Parser::advance() {
 // ============================================================================
 // 메인 파싱 진입점
 // ============================================================================
-SelectStmt Parser::parse(const std::string& sql) {
+// Helper: uppercase a string value (for context-sensitive keyword matching)
+static std::string to_upper_str(const std::string& s) {
+    std::string u = s;
+    std::transform(u.begin(), u.end(), u.begin(),
+                   [](unsigned char c) { return std::toupper(c); });
+    return u;
+}
+
+// ============================================================================
+// parse_statement: top-level dispatcher — SELECT or DDL
+// ============================================================================
+ParsedStatement Parser::parse_statement(const std::string& sql) {
     Tokenizer tok;
     tokens_ = tok.tokenize(sql);
     pos_ = 0;
 
-    // EXPLAIN prefix: parse the flag, then the rest as normal SELECT
+    const Token& first = current();
+    if (first.type == TokenType::IDENT) {
+        const std::string up = to_upper_str(first.value);
+        if (up == "CREATE" || up == "DROP" || up == "ALTER") {
+            return dispatch_ddl();
+        }
+    }
+
+    // Default: SELECT (handles EXPLAIN, WITH, UNION etc.)
+    ParsedStatement ps;
+    ps.kind = ParsedStatement::Kind::SELECT;
+
     bool is_explain = false;
-    if (check(TokenType::EXPLAIN)) {
-        advance();
-        is_explain = true;
-    }
+    if (check(TokenType::EXPLAIN)) { advance(); is_explain = true; }
 
-    // WITH clause: parse CTE definitions before the main SELECT
     std::vector<CTEDef> cte_defs;
-    if (check(TokenType::WITH)) {
-        cte_defs = parse_cte_list();
-    }
+    if (check(TokenType::WITH)) cte_defs = parse_cte_list();
 
-    SelectStmt stmt = parse_select();
-    stmt.cte_defs = std::move(cte_defs);
-    stmt.explain  = is_explain;
+    SelectStmt sel = parse_select();
+    sel.cte_defs = std::move(cte_defs);
+    sel.explain  = is_explain;
 
-    // UNION [ALL] / INTERSECT / EXCEPT chaining
     while (check(TokenType::UNION) || check(TokenType::INTERSECT) || check(TokenType::EXCEPT)) {
         SelectStmt::SetOp op;
         if (match(TokenType::UNION)) {
@@ -92,13 +107,158 @@ SelectStmt Parser::parse(const std::string& sql) {
         } else if (match(TokenType::INTERSECT)) {
             op = SelectStmt::SetOp::INTERSECT;
         } else {
-            advance(); // EXCEPT
+            advance();
             op = SelectStmt::SetOp::EXCEPT;
         }
-        stmt.set_op = op;
-        stmt.rhs    = std::make_shared<SelectStmt>(parse_select());
+        sel.set_op = op;
+        sel.rhs = std::make_shared<SelectStmt>(parse_select());
     }
+
+    ps.select = std::move(sel);
+    return ps;
+}
+
+SelectStmt Parser::parse(const std::string& sql) {
+    auto ps = parse_statement(sql);
+    if (ps.kind != ParsedStatement::Kind::SELECT || !ps.select)
+        throw std::runtime_error("Expected SELECT statement, got DDL");
+    return std::move(*ps.select);
+}
+
+// ============================================================================
+// DDL helpers
+// ============================================================================
+ParsedStatement Parser::dispatch_ddl() {
+    const std::string verb = to_upper_str(current().value);
+    advance(); // consume CREATE / DROP / ALTER
+
+    if (verb == "CREATE") {
+        if (current().type != TokenType::IDENT ||
+            to_upper_str(current().value) != "TABLE")
+            throw std::runtime_error("Expected TABLE after CREATE");
+        advance(); // consume TABLE
+        ParsedStatement ps;
+        ps.kind = ParsedStatement::Kind::CREATE_TABLE;
+        ps.create_table = parse_create_table();
+        return ps;
+    }
+    if (verb == "DROP") {
+        if (current().type != TokenType::IDENT ||
+            to_upper_str(current().value) != "TABLE")
+            throw std::runtime_error("Expected TABLE after DROP");
+        advance(); // consume TABLE
+        ParsedStatement ps;
+        ps.kind = ParsedStatement::Kind::DROP_TABLE;
+        ps.drop_table = parse_drop_table();
+        return ps;
+    }
+    // ALTER
+    if (current().type != TokenType::IDENT ||
+        to_upper_str(current().value) != "TABLE")
+        throw std::runtime_error("Expected TABLE after ALTER");
+    advance(); // consume TABLE
+    ParsedStatement ps;
+    ps.kind = ParsedStatement::Kind::ALTER_TABLE;
+    ps.alter_table = parse_alter_table();
+    return ps;
+}
+
+CreateTableStmt Parser::parse_create_table() {
+    CreateTableStmt stmt;
+
+    // IF NOT EXISTS
+    if (current().type == TokenType::IDENT &&
+        to_upper_str(current().value) == "IF") {
+        advance(); // IF
+        if (current().type != TokenType::NOT)
+            throw std::runtime_error("Expected NOT after IF in CREATE TABLE");
+        advance(); // NOT
+        if (current().type != TokenType::IDENT ||
+            to_upper_str(current().value) != "EXISTS")
+            throw std::runtime_error("Expected EXISTS after IF NOT");
+        advance(); // EXISTS
+        stmt.if_not_exists = true;
+    }
+
+    stmt.table_name = expect(TokenType::IDENT, "table name").value;
+    expect(TokenType::LPAREN, "(");
+
+    do {
+        stmt.columns.push_back(parse_ddl_column_def());
+    } while (match(TokenType::COMMA));
+
+    expect(TokenType::RPAREN, ")");
     return stmt;
+}
+
+DropTableStmt Parser::parse_drop_table() {
+    DropTableStmt stmt;
+
+    // IF EXISTS
+    if (current().type == TokenType::IDENT &&
+        to_upper_str(current().value) == "IF") {
+        advance(); // IF
+        if (current().type != TokenType::IDENT ||
+            to_upper_str(current().value) != "EXISTS")
+            throw std::runtime_error("Expected EXISTS after IF in DROP TABLE");
+        advance(); // EXISTS
+        stmt.if_exists = true;
+    }
+
+    stmt.table_name = expect(TokenType::IDENT, "table name").value;
+    return stmt;
+}
+
+AlterTableStmt Parser::parse_alter_table() {
+    AlterTableStmt stmt;
+    stmt.table_name = expect(TokenType::IDENT, "table name").value;
+
+    if (current().type != TokenType::IDENT)
+        throw std::runtime_error("Expected ADD, DROP, or SET after ALTER TABLE name");
+
+    const std::string action = to_upper_str(current().value);
+    advance();
+
+    if (action == "ADD") {
+        // ADD [COLUMN] col type
+        if (current().type == TokenType::IDENT &&
+            to_upper_str(current().value) == "COLUMN")
+            advance(); // optional COLUMN keyword
+        stmt.action  = AlterTableStmt::Action::ADD_COLUMN;
+        stmt.col_def = parse_ddl_column_def();
+    } else if (action == "DROP") {
+        // DROP [COLUMN] col
+        if (current().type == TokenType::IDENT &&
+            to_upper_str(current().value) == "COLUMN")
+            advance(); // optional COLUMN keyword
+        stmt.action   = AlterTableStmt::Action::DROP_COLUMN;
+        stmt.col_name = expect(TokenType::IDENT, "column name").value;
+    } else if (action == "SET") {
+        // SET TTL n DAYS | HOURS
+        if (current().type != TokenType::IDENT ||
+            to_upper_str(current().value) != "TTL")
+            throw std::runtime_error("Expected TTL after SET");
+        advance(); // TTL
+        stmt.action    = AlterTableStmt::Action::SET_TTL;
+        stmt.ttl_value = parse_integer_literal();
+        if (current().type == TokenType::IDENT) {
+            stmt.ttl_unit = to_upper_str(current().value); // DAYS or HOURS
+            advance();
+        } else {
+            stmt.ttl_unit = "DAYS"; // default
+        }
+    } else {
+        throw std::runtime_error("Unknown ALTER TABLE action: " + action);
+    }
+
+    return stmt;
+}
+
+DdlColumnDef Parser::parse_ddl_column_def() {
+    DdlColumnDef col;
+    col.column   = expect(TokenType::IDENT, "column name").value;
+    col.type_str = to_upper_str(expect(TokenType::IDENT, "column type").value);
+    return col;
 }
 
 // ============================================================================
@@ -226,6 +386,13 @@ SelectExpr Parser::parse_select_expr() {
         if (func == AggFunc::COUNT && check(TokenType::STAR)) {
             advance();
             expr.column = "*";
+        } else if (func == AggFunc::COUNT && check(TokenType::DISTINCT)) {
+            advance();  // consume DISTINCT
+            expr.agg_distinct = true;
+            std::string alias, col;
+            parse_qualified_name(alias, col);
+            expr.table_alias = alias;
+            expr.column = col;
         } else if (func == AggFunc::VWAP) {
             // VWAP(price, volume)
             std::string alias1, col1;

@@ -159,5 +159,19 @@ std::vector<Partition*> PartitionManager::get_partitions_for_time_range(
     return result;
 }
 
+size_t PartitionManager::evict_older_than(int64_t cutoff_ns) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    size_t count = 0;
+    for (auto it = partitions_.begin(); it != partitions_.end(); ) {
+        if (it->first.hour_epoch < cutoff_ns) {
+            it = partitions_.erase(it);
+            ++count;
+        } else {
+            ++it;
+        }
+    }
+    return count;
+}
+
 } // namespace apex::storage
 

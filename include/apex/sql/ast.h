@@ -110,6 +110,7 @@ struct CTEDef {
 // ============================================================================
 struct SelectExpr {
     AggFunc     agg    = AggFunc::NONE;
+    bool        agg_distinct = false;  // COUNT(DISTINCT col)
     std::string table_alias;   // 없으면 ""
     std::string column;        // "*" 이면 전체, "1" 이면 COUNT(*)
     std::string agg_arg2;      // VWAP(price, volume)의 두 번째 인자
@@ -321,6 +322,63 @@ struct SelectStmt {
     enum class SetOp { NONE, UNION_ALL, UNION_DISTINCT, INTERSECT, EXCEPT };
     SetOp                       set_op = SetOp::NONE;
     std::shared_ptr<SelectStmt> rhs;           // right-hand side of set operation
+};
+
+// ============================================================================
+// DDL: Column definition in CREATE TABLE / ALTER TABLE ADD COLUMN
+// ============================================================================
+struct DdlColumnDef {
+    std::string column;    // column name
+    std::string type_str;  // "INT64" | "INT32" | "FLOAT64" | "FLOAT32"
+                           // | "TIMESTAMP" | "SYMBOL" | "BOOL"
+};
+
+// ============================================================================
+// DDL: CREATE TABLE [IF NOT EXISTS] name (col type [, col type ...])
+// ============================================================================
+struct CreateTableStmt {
+    std::string               table_name;
+    std::vector<DdlColumnDef> columns;
+    bool                      if_not_exists = false;
+};
+
+// ============================================================================
+// DDL: DROP TABLE [IF EXISTS] name
+// ============================================================================
+struct DropTableStmt {
+    std::string table_name;
+    bool        if_exists = false;
+};
+
+// ============================================================================
+// DDL: ALTER TABLE name ...
+//   ADD COLUMN col type
+//   DROP COLUMN col
+//   SET TTL n DAYS | HOURS
+// ============================================================================
+struct AlterTableStmt {
+    enum class Action { ADD_COLUMN, DROP_COLUMN, SET_TTL };
+
+    std::string  table_name;
+    Action       action = Action::ADD_COLUMN;
+
+    DdlColumnDef col_def;    // ADD COLUMN
+    std::string  col_name;   // DROP COLUMN
+    int64_t      ttl_value = 0;   // SET TTL n
+    std::string  ttl_unit;        // "DAYS" | "HOURS"
+};
+
+// ============================================================================
+// ParsedStatement: top-level statement — SELECT or DDL
+// ============================================================================
+struct ParsedStatement {
+    enum class Kind { SELECT, CREATE_TABLE, DROP_TABLE, ALTER_TABLE };
+
+    Kind kind = Kind::SELECT;
+    std::optional<SelectStmt>       select;
+    std::optional<CreateTableStmt>  create_table;
+    std::optional<DropTableStmt>    drop_table;
+    std::optional<AlterTableStmt>   alter_table;
 };
 
 } // namespace apex::sql
