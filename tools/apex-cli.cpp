@@ -385,6 +385,17 @@ public:
             return r;
         }
 
+        // \t <sql> — run one query with timing enabled (one-shot, toggle unchanged)
+        if (cmd.size() > 3 && cmd.substr(0, 3) == "\\t ") {
+            std::string sql = cmd.substr(3);
+            bool saved_timing = cfg_.timing;
+            cfg_.timing = true;
+            execute_query(sql);
+            cfg_.timing = saved_timing;
+            r.handled = true;
+            return r;
+        }
+
         if (cmd.substr(0, 3) == "\\f ") {
             cfg_.format = cmd.substr(3);
             std::cout << "Format: " << cfg_.format << "\n";
@@ -475,6 +486,7 @@ Built-in Commands:
   \h, help         Show this help
   \s, status       Show server status and statistics
   \t               Toggle query timing (currently )" << (cfg_.timing ? "ON" : "OFF") << R"()
+  \t <sql>         Run a query with timing enabled (one-shot, toggle unchanged)
   \f <format>      Set output format: pretty | csv | tsv | json
   \v               Toggle verbose mode
 

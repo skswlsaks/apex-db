@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <future>
 #include <chrono>
+#include <algorithm>
 
 namespace apex::server {
 
@@ -37,6 +38,7 @@ HttpServer::HttpServer(apex::sql::QueryExecutor& executor, uint16_t port)
     setup_routes();
     setup_auth_middleware();
     setup_admin_routes();
+    setup_session_tracking();
 }
 
 HttpServer::HttpServer(apex::sql::QueryExecutor& executor,
@@ -67,6 +69,7 @@ HttpServer::HttpServer(apex::sql::QueryExecutor& executor,
     setup_routes();
     setup_auth_middleware();
     setup_admin_routes();
+    setup_session_tracking();
 }
 
 HttpServer::~HttpServer() {
@@ -105,6 +108,82 @@ void HttpServer::setup_auth_middleware() {
         res.set_content(build_error_json(decision.reason), "application/json");
         return httplib::Server::HandlerResponse::Handled;
     });
+}
+
+// ============================================================================
+// setup_session_tracking — httplib logger fires after every request
+// ============================================================================
+void HttpServer::setup_session_tracking() {
+    svr_->set_logger([this](const httplib::Request& req,
+                            const httplib::Response& /*res*/) {
+        bool closing = req.has_header("Connection") &&
+                       req.get_header_value("Connection") == "close";
+        track_session(req.remote_addr, closing);
+    });
+}
+
+void HttpServer::track_session(const std::string& remote_addr, bool is_closing) {
+    using namespace std::chrono;
+    int64_t now = duration_cast<nanoseconds>(
+        system_clock::now().time_since_epoch()).count();
+
+    std::unique_lock<std::mutex> lk(sessions_mu_);
+    auto it = sessions_.find(remote_addr);
+    if (it == sessions_.end()) {
+        // New session — fire on_connect
+        ConnectionInfo info;
+        info.remote_addr     = remote_addr;
+        info.user            = remote_addr;  // overridden by auth subject when available
+        info.connected_at_ns = now;
+        info.last_active_ns  = now;
+        info.query_count     = 1;
+        sessions_[remote_addr] = info;
+        ConnectionInfo copy = sessions_[remote_addr];
+        lk.unlock();
+        if (on_connect_) on_connect_(copy);
+    } else {
+        it->second.last_active_ns = now;
+        it->second.query_count++;
+        if (is_closing) {
+            // Client signalled connection close — fire on_disconnect
+            ConnectionInfo copy = it->second;
+            sessions_.erase(it);
+            lk.unlock();
+            if (on_disconnect_) on_disconnect_(copy);
+        }
+    }
+}
+
+std::vector<ConnectionInfo> HttpServer::list_sessions() const {
+    std::lock_guard<std::mutex> lk(sessions_mu_);
+    std::vector<ConnectionInfo> result;
+    result.reserve(sessions_.size());
+    for (const auto& [_, info] : sessions_)
+        result.push_back(info);
+    return result;
+}
+
+size_t HttpServer::evict_idle_sessions(int64_t timeout_ms) {
+    using namespace std::chrono;
+    int64_t now = duration_cast<nanoseconds>(
+        system_clock::now().time_since_epoch()).count();
+    int64_t timeout_ns = timeout_ms * 1'000'000LL;
+
+    std::unique_lock<std::mutex> lk(sessions_mu_);
+    std::vector<ConnectionInfo> evicted;
+    for (auto it = sessions_.begin(); it != sessions_.end(); ) {
+        if (now - it->second.last_active_ns > timeout_ns) {
+            evicted.push_back(it->second);
+            it = sessions_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    lk.unlock();
+
+    for (const auto& info : evicted)
+        if (on_disconnect_) on_disconnect_(info);
+    return evicted.size();
 }
 
 // ============================================================================
@@ -424,6 +503,29 @@ void HttpServer::setup_admin_routes() {
     });
 
     // -------------------------------------------------------------------------
+    // GET /admin/sessions — list active client sessions (.z.po equivalent)
+    // -------------------------------------------------------------------------
+    svr_->Get("/admin/sessions", [this, require_admin](
+        const httplib::Request& req, httplib::Response& res)
+    {
+        if (!require_admin(req, res)) return;
+        auto sessions = list_sessions();
+        std::ostringstream os;
+        os << "[";
+        for (size_t i = 0; i < sessions.size(); ++i) {
+            if (i > 0) os << ",";
+            const auto& s = sessions[i];
+            os << "{\"remote_addr\":\"" << s.remote_addr << "\","
+               << "\"user\":\"" << s.user << "\","
+               << "\"connected_at_ns\":" << s.connected_at_ns << ","
+               << "\"last_active_ns\":" << s.last_active_ns << ","
+               << "\"query_count\":" << s.query_count << "}";
+        }
+        os << "]";
+        res.set_content(os.str(), "application/json");
+    });
+
+    // -------------------------------------------------------------------------
     // GET /admin/version — server version info
     // -------------------------------------------------------------------------
     svr_->Get("/admin/version", [require_admin](
@@ -578,7 +680,20 @@ std::string HttpServer::build_prometheus_metrics() const {
     os << "# TYPE apex_server_ready gauge\n";
     os << "apex_server_ready " << (ready_.load() ? "1" : "0") << "\n";
 
+    // Append output from registered metrics providers (e.g. Kafka consumers).
+    {
+        std::lock_guard<std::mutex> lk(providers_mu_);
+        for (const auto& provider : metrics_providers_) {
+            os << "\n" << provider();
+        }
+    }
+
     return os.str();
+}
+
+void HttpServer::add_metrics_provider(std::function<std::string()> provider) {
+    std::lock_guard<std::mutex> lk(providers_mu_);
+    metrics_providers_.push_back(std::move(provider));
 }
 
 } // namespace apex::server
